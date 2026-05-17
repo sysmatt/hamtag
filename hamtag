@@ -4,10 +4,9 @@
 Looks up HAM callsigns in a hamdat SQLite database and produces ZPL
 ready to send to a Zebra thermal label printer.
 
-Label format: 4"x6" stock, all content rotated 90° clockwise so the badge
-reads correctly in landscape orientation (6" wide, 4" tall when worn).
-The callsign is rendered as a bitmap via Pillow, allowing any installed
-TTF font — including fonts with a slashed zero.
+Label format: 4"x6" stock rendered as a single PIL bitmap, rotated 90°
+clockwise for landscape orientation (6" wide, 4" tall when worn).
+The same PIL image is used for both the print output and the GUI preview.
 
 Author: Matt Hoskins, K2TTA
 """
@@ -25,10 +24,24 @@ except ImportError:
 
 DB_DEFAULT = Path.home() / ".hamdat" / "hamdat.db"
 
-# TTF fonts searched in order for callsign rendering.
-# Bold weights are preferred — they print more crisply on thermal printers.
-# Fonts with a slashed zero are listed first.
-# To get a slashed zero:  sudo apt install fonts-hack
+# TTF fonts searched in order.  Bold weights preferred; slashed-zero fonts first.
+# Install fonts-hack for a slashed zero:  sudo apt install fonts-hack
+# Layout proportions (all sizes in inches) per label stock.
+# 4x6: physical 4"×6" portrait on the roll; rendered landscape, rotated 90° CW for ZPL.
+# 4x2: physical 4"×2"; rendered as-is, no rotation needed.
+_LABEL_CFG = {
+    "4x6": dict(
+        lw_in=6,   lh_in=4,   rotate=True,
+        mt=0.17,   mb=0.17,   ms=0.20,  gap=0.07, div=4,
+        banner_h=0.24, name_h=0.37, loc_h=0.31, note_h=0.27, call_pad=0.05,
+    ),
+    "4x2": dict(
+        lw_in=4,   lh_in=2,   rotate=False,
+        mt=0.13,   mb=0.09,   ms=0.12,  gap=0.04, div=3,
+        banner_h=0.15, name_h=0.20, loc_h=0.17, note_h=0.14, call_pad=0.03,
+    ),
+}
+
 _FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/hack/Hack-Bold.ttf",
     "/usr/share/fonts/truetype/hack/Hack-Regular.ttf",
@@ -64,7 +77,6 @@ def lookup_callsign(callsign, db_path):
     """Return (name, city, state) from hamdat DB, or (None, None, None)."""
     db = Path(db_path)
     if not db.exists():
-        print(f"Warning: database not found at {db}", file=sys.stderr)
         return None, None, None
 
     conn = sqlite3.connect(db)
@@ -97,170 +109,349 @@ def lookup_callsign(callsign, db_path):
     return name or None, city or None, state or None
 
 
-def _render_callsign_gf(callsign, font_path, avail_w, max_h, padding=10):
-    """Render the callsign as a 90°-rotated ZPL ^GF graphic field string.
+def make_label_image(callsign, name, location, banner=None, note=None,
+                     dpi=203, font_path=None, label="4x6"):
+    """Render the complete label as a PIL RGB Image in reading orientation.
 
-    Finds the largest font size that fits within avail_w × max_h (in landscape
-    dot-space), renders the text centered on a white canvas, rotates the canvas
-    90° clockwise, and returns (gf_command_string, landscape_height_used).
-
-    avail_w  – available landscape width in dots (physical label height - side margins)
-    max_h    – maximum landscape height in dots (available physical-X budget)
-
-    Rotation model: the physical label is 4"×6" (portrait). All content is
-    designed in landscape space and stored rotated 90° CW on the physical paper.
-    When the label is turned 90° CCW to wear/read, everything appears upright.
+    Call label_image_to_zpl() to rotate (if needed) and convert for printing.
     """
-    inner_w = avail_w - padding * 2
-    inner_h = max_h   - padding * 2
+    cfg = _LABEL_CFG[label]
+    lw  = round(cfg["lw_in"]   * dpi)
+    lh  = round(cfg["lh_in"]   * dpi)
+    mt  = round(cfg["mt"]      * dpi)
+    mb  = round(cfg["mb"]      * dpi)
+    ms  = round(cfg["ms"]      * dpi)
+    div = cfg["div"]
+    gap = round(cfg["gap"]     * dpi)
+    name_h   = round(cfg["name_h"]   * dpi)
+    loc_h    = round(cfg["loc_h"]    * dpi)
+    note_h   = round(cfg["note_h"]   * dpi)
+    call_pad = round(cfg["call_pad"] * dpi)
 
-    # Binary-search for the largest point size whose bounding box fits both limits.
-    lo, hi = 8, inner_h
-    best_size = lo
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        font = ImageFont.truetype(font_path, mid)
-        bbox = font.getbbox(callsign)       # (left, top, right, bottom)
-        if (bbox[2] - bbox[0]) <= inner_w and (bbox[3] - bbox[1]) <= inner_h:
-            best_size = mid
-            lo = mid + 1
-        else:
-            hi = mid - 1
-
-    font = ImageFont.truetype(font_path, best_size)
-    bbox = font.getbbox(callsign)
-    tw = bbox[2] - bbox[0]
-    th = bbox[3] - bbox[1]
-
-    # Canvas: full avail_w wide × (text height + padding) tall, white background.
-    canvas_h = th + padding * 2
-    img = Image.new("1", (avail_w, canvas_h), 1)       # 1 = white
+    img  = Image.new("RGB", (lw, lh), "white")
     draw = ImageDraw.Draw(img)
-    x = (avail_w - tw) // 2 - bbox[0]                  # center horizontally
-    y = padding - bbox[1]                               # respect ascent offset
-    draw.text((x, y), callsign, fill=0, font=font)      # 0 = black
+    draw.rectangle([10, 10, lw - 11, lh - 11], outline="black", width=3)
 
-    # Rotate 90° clockwise so it prints correctly on the physical label.
-    # Physical label turned 90° CCW when worn → text reads normally in landscape.
-    rotated = img.rotate(-90, expand=True)
-    # After rotation: rotated.size = (canvas_h, avail_w)
-    # Physical-X extent = canvas_h  (= landscape height consumed)
-    # Physical-Y extent = avail_w   (= landscape width, spans margin to margin)
+    def fit_font(text, max_h, max_w=None):
+        """Binary-search for the largest point size fitting max_w × max_h."""
+        if max_w is None:
+            max_w = lw - 2 * ms
+        lo, hi = 8, max_h
+        best = lo
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            f   = ImageFont.truetype(font_path, mid)
+            bb  = f.getbbox(text)
+            if (bb[2] - bb[0]) <= max_w and (bb[3] - bb[1]) <= max_h:
+                best = mid
+                lo   = mid + 1
+            else:
+                hi = mid - 1
+        return ImageFont.truetype(font_path, best)
 
-    # Convert to ZPL ^GF ASCII hex.
-    # PIL mode-1: white=1 bit, black=0 bit → invert so ZPL 1=printed dot.
-    rw, _ = rotated.size          # rw = canvas_h (physical-X width of image)
+    def draw_centered(text, font, y):
+        """Draw text horizontally centered at y. Returns rendered text height."""
+        bb = font.getbbox(text)
+        x  = (lw - (bb[2] - bb[0])) // 2 - bb[0]
+        draw.text((x, y - bb[1]), text, fill="black", font=font)
+        return bb[3] - bb[1]
+
+    def draw_divider(y):
+        draw.rectangle([ms, y, lw - ms, y + div - 1], fill="black")
+
+    y = mt
+
+    # ── Banner (optional) ─────────────────────────────────────────────────────
+    if banner:
+        bh = round(cfg["banner_h"] * dpi)
+        draw_centered(banner, fit_font(banner, bh), y)
+        y += bh + gap
+        draw_divider(y)
+        y += div + gap
+
+    # ── Callsign ──────────────────────────────────────────────────────────────
+    reserved = (
+        gap + div + gap
+        + name_h + gap
+        + (loc_h if location else 0)
+        + (note_h + gap if note else 0)
+        + mb
+    )
+    call_budget = lh - y - reserved
+    f  = fit_font(callsign, call_budget - call_pad * 2,
+                  max_w=lw - 2 * ms - call_pad * 2)
+    th = draw_centered(callsign, f, y + call_pad)
+    y += th + call_pad * 2 + gap
+
+    # ── Divider ───────────────────────────────────────────────────────────────
+    draw_divider(y)
+    y += div + gap
+
+    # ── Name ──────────────────────────────────────────────────────────────────
+    draw_centered(name, fit_font(name, name_h), y)
+    y += name_h + gap
+
+    # ── Location ──────────────────────────────────────────────────────────────
+    if location:
+        draw_centered(location, fit_font(location, loc_h), y)
+
+    # ── Note (pinned to bottom) ───────────────────────────────────────────────
+    if note:
+        note_y = lh - mb - note_h
+        draw_centered(note, fit_font(note, note_h), note_y)
+
+    return img
+
+
+def label_image_to_zpl(img, dpi=203, label="4x6"):
+    """Convert a PIL label Image to a ZPL string ready to send to the printer."""
+    cfg = _LABEL_CFG[label]
+    out = img.rotate(-90, expand=True) if cfg["rotate"] else img
+    out = out.convert("1", dither=Image.Dither.NONE)
+    phys_w = round((cfg["lh_in"] if cfg["rotate"] else cfg["lw_in"]) * dpi)
+    phys_h = round((cfg["lw_in"] if cfg["rotate"] else cfg["lh_in"]) * dpi)
+    rw, _  = out.size
     bytes_per_row = (rw + 7) // 8
-    raw      = rotated.tobytes()
-    inverted = bytes(b ^ 0xFF for b in raw)
+    raw      = out.tobytes()
+    inverted = bytes(b ^ 0xFF for b in raw)   # PIL white=1 → ZPL 0 (no ink)
     total    = len(inverted)
     hex_data = inverted.hex().upper()
-
-    gf = f"^GFA,{total},{total},{bytes_per_row},{hex_data}"
-    return gf, canvas_h
-
-
-def make_zpl(callsign, name, location, banner=None, note=None, dpi=203, font_path=None):
-    """Generate ZPL for a landscape name badge on 4"×6" label stock.
-
-    Physical label: 4" wide (print width) × 6" long (feed direction).
-    All ZPL text elements use ^A0R (rotate 90° CW).
-    The callsign is a ^GF bitmap rendered via Pillow and also rotated 90° CW.
-
-    Coordinate model:
-      land_y  — landscape-Y cursor from the landscape top (in dots).
-      phys_x  = phys_w - land_y - element_height  (converts landscape→physical).
-      Landscape centering (left↔right) uses ^FB across the full physical height.
-    """
-    phys_w = round(4 * dpi)    # physical label width  (4 inches)
-    phys_h = round(6 * dpi)    # physical label length (6 inches)
-
-    margin_top    = round(0.17 * dpi)
-    margin_bottom = round(0.17 * dpi)
-    margin_side   = round(0.20 * dpi)
-    div_thick = 4
-
-    lines = [
+    return "\n".join([
         "^XA",
-        "^CI28",
         f"^PW{phys_w}",
         f"^LL{phys_h}",
         "^LH0,0",
-        f"^FO10,10^GB{phys_w - 20},{phys_h - 20},3^FS",
+        f"^FO0,0^GFA,{total},{total},{bytes_per_row},{hex_data}^FS",
+        "^XZ",
+    ])
+
+
+def _send_to_printer(zpl, device_path):
+    """Write ZPL bytes to a printer device. Raises OSError / PermissionError."""
+    with open(device_path, "wb") as f:
+        f.write(zpl.encode())
+
+
+def run_gui(args):
+    """Launch the interactive tkinter GUI."""
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        from PIL import ImageTk
+    except ImportError as exc:
+        sys.exit(f"GUI requires tkinter (usually bundled with Python): {exc}")
+
+    font_path      = find_font(args.font)
+    dpi            = args.dpi
+    label          = args.label
+    printer_device = args.printer or "/dev/usb/lp0"
+
+    root = tk.Tk()
+    root.title("hamtag — Ham Badge Printer")
+    root.resizable(False, False)
+
+    call_var     = tk.StringVar(value=(args.call or "").upper())
+    name_var     = tk.StringVar(value=args.name or "")
+    location_var = tk.StringVar(value=args.location or "")
+    banner_var   = tk.StringVar(value=args.banner or "")
+    note_var     = tk.StringVar(value=args.note or "")
+    status_var   = tk.StringVar(value="Enter a callsign and press Enter to look up.")
+
+    # Capture initial CLI values so Default button can restore them
+    default_banner = args.banner or ""
+    default_note   = args.note   or ""
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+    outer = tk.Frame(root, padx=10, pady=10)
+    outer.pack()
+
+    form_frame = tk.LabelFrame(outer, text="Badge Details", padx=10, pady=10)
+    form_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+
+    prev_frame = tk.LabelFrame(outer, text="Preview", padx=4, pady=4)
+    prev_frame.grid(row=0, column=1, sticky="nsew")
+
+    # Scale preview to fit a fixed 609×406 box, preserving label aspect ratio.
+    cfg  = _LABEL_CFG[label]
+    _scl = min(round(6 * 203 * 0.5) / (cfg["lw_in"] * dpi),
+               round(4 * 203 * 0.5) / (cfg["lh_in"] * dpi))
+    PW   = round(cfg["lw_in"] * dpi * _scl)
+    PH   = round(cfg["lh_in"] * dpi * _scl)
+    prev_lbl = tk.Label(prev_frame, width=PW, height=PH, bg="gray80")
+    prev_lbl.pack()
+
+    fields_def = [
+        ("Banner",   banner_var),
+        ("Callsign", call_var),
+        ("Name",     name_var),
+        ("Location", location_var),
+        ("Note",     note_var),
     ]
+    entries = {}
+    for i, (lbl, var) in enumerate(fields_def):
+        tk.Label(form_frame, text=lbl + ":", anchor="e", width=9).grid(
+            row=i, column=0, sticky="e", pady=4)
+        e = tk.Entry(form_frame, textvariable=var, width=28,
+                     font=("TkDefaultFont", 11))
+        e.grid(row=i, column=1, sticky="ew", pady=4)
+        entries[lbl] = e
 
-    land_y = margin_top
+    btn_row = tk.Frame(form_frame)
+    btn_row.grid(row=len(fields_def), column=0, columnspan=2, pady=(12, 0))
 
-    def add_text(h, w, text):
-        """Append a centered, R-rotated ^A0 text field and advance land_y."""
-        nonlocal land_y
-        phys_x = phys_w - land_y - h
-        if phys_x >= 0:
-            lines.append(
-                f"^FO{phys_x},0^FB{phys_h},1,0,C,0^A0R,{h},{w}^FD{text}^FS"
+    lookup_btn  = tk.Button(btn_row, text="Look Up",  width=12)
+    lookup_btn.pack(side="left", padx=6)
+    print_btn   = tk.Button(btn_row, text="Print It!", width=12, state="disabled")
+    print_btn.pack(side="left", padx=6)
+    default_btn = tk.Button(btn_row, text="Default",  width=10)
+    default_btn.pack(side="left", padx=6)
+
+    tk.Label(root, textvariable=status_var, anchor="w",
+             relief="sunken", bd=1, padx=6).pack(fill="x", side="bottom")
+
+    # ── Preview ───────────────────────────────────────────────────────────────
+    _job   = [None]
+    _photo = [None]   # keep reference so GC doesn't collect it
+
+    def refresh_preview():
+        cs  = call_var.get().strip().upper() or "CALL"
+        nm  = name_var.get().strip() or cs
+        loc = location_var.get().strip() or None
+        ban = banner_var.get().strip() or None
+        nt  = note_var.get().strip() or None
+        try:
+            pil = make_label_image(cs, nm, loc, ban, nt, dpi, font_path, label)
+            pil = pil.resize((PW, PH), Image.LANCZOS)
+            _photo[0] = ImageTk.PhotoImage(pil)
+            prev_lbl.configure(image=_photo[0])
+        except Exception as exc:
+            status_var.set(f"Preview error: {exc}")
+
+    def schedule_preview(*_):
+        if _job[0]:
+            root.after_cancel(_job[0])
+        _job[0] = root.after(300, refresh_preview)
+
+    for _, var in fields_def:
+        var.trace_add("write", schedule_preview)
+
+    # ── Lookup ────────────────────────────────────────────────────────────────
+    _lookup_found = [False]
+
+    def _print_status():
+        cs = call_var.get().strip().upper()
+        focused = root.focus_get()
+        if _lookup_found[0]:
+            if focused == print_btn:
+                status_var.set(f"{cs} Found in HAMDAT — press Enter to print.")
+            else:
+                status_var.set(f"{cs} Found in HAMDAT — click Print It! to print.")
+        else:
+            status_var.set(f"{cs} NOT Found in HAMDAT — fill in manually.")
+
+    def do_lookup(*_):
+        cs = call_var.get().strip().upper()
+        if not cs:
+            status_var.set("Enter a callsign first.")
+            entries["Callsign"].focus_set()
+            return
+        call_var.set(cs)
+        name_var.set("")
+        location_var.set("")
+        db_name, db_city, db_state = lookup_callsign(cs, args.db)
+        if db_name:
+            name_var.set(db_name)
+        if db_city or db_state:
+            location_var.set(", ".join(p for p in [db_city, db_state] if p))
+        _lookup_found[0] = any([db_name, db_city, db_state])
+        _print_status()
+        print_btn.configure(state="normal")
+        print_btn.focus_set()
+
+    # ── Print ─────────────────────────────────────────────────────────────────
+    def do_print(*_):
+        cs  = call_var.get().strip().upper() or name_var.get().strip()
+        nm  = name_var.get().strip() or cs
+        loc = location_var.get().strip() or None
+        ban = banner_var.get().strip() or None
+        nt  = note_var.get().strip() or None
+        if not cs:
+            status_var.set("Nothing to print.")
+            return
+        try:
+            pil = make_label_image(cs, nm, loc, ban, nt, dpi, font_path, label)
+            zpl = label_image_to_zpl(pil, dpi, label)
+        except Exception as exc:
+            status_var.set(f"Render error: {exc}")
+            return
+        device = Path(printer_device)
+        if not device.exists():
+            messagebox.showerror(
+                "Printer not found",
+                f"Device not found: {printer_device}\n"
+                "Is the printer connected and powered on?",
             )
-        land_y += h
-
-    def add_divider():
-        """Append a landscape-horizontal divider line and advance land_y."""
-        nonlocal land_y
-        phys_x = phys_w - land_y - div_thick
-        if phys_x >= 0:
-            lines.append(
-                f"^FO{phys_x},{margin_side}"
-                f"^GB{div_thick},{phys_h - 2 * margin_side},{div_thick}^FS"
+            return
+        try:
+            _send_to_printer(zpl, device)
+        except PermissionError:
+            messagebox.showerror(
+                "Permission denied",
+                f"Cannot write to {printer_device}\n"
+                f"Fix with:  sudo usermod -aG lp {os.getlogin()}",
             )
-        land_y += div_thick
+            return
+        except OSError as exc:
+            messagebox.showerror("Print error", str(exc))
+            return
+        status_var.set(f"Printed {cs}  ✓")
+        # Reset for next badge — keep banner and note (they're event-level constants)
+        call_var.set("")
+        name_var.set("")
+        location_var.set("")
+        print_btn.configure(state="disabled")
+        entries["Callsign"].focus_set()
 
-    # ── Banner (optional) ────────────────────────────────────────────────────
-    if banner:
-        add_text(round(0.24 * dpi), round(0.21 * dpi), banner)
-        land_y += round(0.07 * dpi)
-        add_divider()
-        land_y += round(0.07 * dpi)
+    # ── Default ───────────────────────────────────────────────────────────────
+    def do_default(*_):
+        call_var.set("")
+        name_var.set("")
+        location_var.set("")
+        banner_var.set(default_banner)
+        note_var.set(default_note)
+        print_btn.configure(state="disabled")
+        status_var.set("Restored defaults — enter a callsign.")
+        entries["Callsign"].focus_set()
 
-    # ── Callsign (Pillow bitmap) ──────────────────────────────────────────────
-    # Compute the space budget: everything below the callsign zone.
-    reserved_below = (
-        round(0.10 * dpi) + div_thick + round(0.09 * dpi)          # gap+divider+gap
-        + round(0.37 * dpi) + round(0.07 * dpi)                     # name + gap
-        + (round(0.31 * dpi) if location else 0)                    # location
-        + (round(0.27 * dpi) + round(0.07 * dpi) if note else 0)   # note + gap
-        + margin_bottom
-    )
-    avail_w = phys_h - 2 * margin_side          # landscape width for the graphic
-    max_h   = phys_w - land_y - reserved_below  # landscape height budget
+    default_btn.configure(command=do_default)
 
-    gf, call_h = _render_callsign_gf(callsign, font_path, avail_w, max_h)
-    phys_x = phys_w - land_y - call_h
-    if phys_x >= 0:
-        lines.append(f"^FO{phys_x},{margin_side}{gf}^FS")
-    land_y += call_h
+    # ── Key bindings ──────────────────────────────────────────────────────────
+    def on_callsign_return(e):
+        do_lookup()
+        return "break"
 
-    land_y += round(0.10 * dpi)
-    add_divider()
-    land_y += round(0.09 * dpi)
+    def on_print_return(e):
+        do_print()
+        return "break"
 
-    # ── Name ─────────────────────────────────────────────────────────────────
-    add_text(round(0.37 * dpi), round(0.32 * dpi), name)
-    land_y += round(0.07 * dpi)
+    entries["Callsign"].bind("<Return>", on_callsign_return)
+    print_btn.bind("<Return>", on_print_return)
 
-    # ── Location ─────────────────────────────────────────────────────────────
-    if location:
-        add_text(round(0.31 * dpi), round(0.27 * dpi), location)
+    print_btn.bind("<FocusIn>",  lambda e: _print_status() if print_btn["state"] == "normal" else None)
+    print_btn.bind("<FocusOut>", lambda e: _print_status() if print_btn["state"] == "normal" else None)
+    lookup_btn.configure(command=do_lookup)
+    print_btn.configure(command=do_print)
 
-    # ── Note (pinned to landscape bottom) ────────────────────────────────────
-    if note:
-        note_phys_x = margin_bottom
-        lines.append(
-            f"^FO{note_phys_x},0"
-            f"^FB{phys_h},1,0,C,0"
-            f"^A0R,{round(0.27 * dpi)},{round(0.23 * dpi)}"
-            f"^FD{note}^FS"
-        )
+    root.bind("<Escape>", do_default)
 
-    lines.append("^XZ")
-    return "\n".join(lines)
+    entries["Callsign"].focus_set()
+    # Trigger an initial lookup if --call was supplied on the command line
+    if args.call:
+        do_lookup()
+    else:
+        refresh_preview()
+
+    root.mainloop()
 
 
 def main():
@@ -292,7 +483,7 @@ def main():
     )
     parser.add_argument(
         "--font", metavar="FILE",
-        help="TrueType font for the callsign (auto-detected if omitted; "
+        help="TrueType font for all text (auto-detected if omitted; "
              "install fonts-hack for a slashed zero)",
     )
     parser.add_argument(
@@ -304,6 +495,10 @@ def main():
         help="Printer DPI — 203 (default) or 300",
     )
     parser.add_argument(
+        "--label", choices=["4x6", "4x2"], default="4x6",
+        help="Label stock — 4x6 landscape badge (default) or 4x2 portrait",
+    )
+    parser.add_argument(
         "--output", metavar="FILE",
         help="Write ZPL to FILE instead of stdout",
     )
@@ -311,10 +506,20 @@ def main():
         "--printer", metavar="DEVICE", nargs="?", const="/dev/usb/lp0",
         help="Send ZPL directly to a USB Zebra printer (default: /dev/usb/lp0)",
     )
+    parser.add_argument(
+        "--gui", action="store_true",
+        help="Launch interactive GUI (other flags pre-fill the form)",
+    )
     args = parser.parse_args()
 
+    # ── GUI mode ──────────────────────────────────────────────────────────────
+    if args.gui:
+        run_gui(args)
+        return
+
+    # ── CLI mode ──────────────────────────────────────────────────────────────
     if not args.call and not args.name:
-        parser.error("--call and/or --name is required")
+        parser.error("--call and/or --name is required (or use --gui)")
 
     callsign = (args.call or "").upper().strip()
     name     = args.name
@@ -335,13 +540,15 @@ def main():
     display_call = callsign if callsign else name
     font_path    = find_font(args.font)
 
-    zpl = make_zpl(
+    img = make_label_image(
         display_call, name, location,
         banner=args.banner,
         note=args.note,
         dpi=args.dpi,
         font_path=font_path,
+        label=args.label,
     )
+    zpl = label_image_to_zpl(img, args.dpi, args.label)
 
     if args.output:
         Path(args.output).write_text(zpl)
@@ -356,8 +563,7 @@ def main():
                 "You may need: sudo chmod a+rw /dev/usb/lp0"
             )
         try:
-            with open(device, "wb") as f:
-                f.write(zpl.encode("utf-8"))
+            _send_to_printer(zpl, device)
             print(f"Sent to {device}", file=sys.stderr)
         except PermissionError:
             sys.exit(
