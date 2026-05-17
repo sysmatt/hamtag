@@ -1,0 +1,8 @@
+# Python 3.9 or later is required.
+Pillow>=9.0
+
+# Optional companion tool for database population:
+#   hamdat  https://github.com/sysmatt/hamdat
+
+# For a slashed zero in the callsign (recommended):
+#   sudo apt install fonts-hack

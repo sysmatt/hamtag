@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""hamtag - Generate ZPL name badge labels for Zebra thermal printers.
+
+Looks up HAM callsigns in a hamdat SQLite database and produces ZPL
+ready to send to a Zebra thermal label printer.
+
+Label format: 4"x6" stock, all content rotated 90° clockwise so the badge
+reads correctly in landscape orientation (6" wide, 4" tall when worn).
+The callsign is rendered as a bitmap via Pillow, allowing any installed
+TTF font — including fonts with a slashed zero.
+
+Author: Matt Hoskins, K2TTA
+"""
+
+import argparse
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    sys.exit("Install Pillow:  pip install Pillow")
+
+DB_DEFAULT = Path.home() / ".hamdat" / "hamdat.db"
+
+# TTF fonts searched in order for callsign rendering.
+# Bold weights are preferred — they print more crisply on thermal printers.
+# Fonts with a slashed zero are listed first.
+# To get a slashed zero:  sudo apt install fonts-hack
+_FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/hack/Hack-Bold.ttf",
+    "/usr/share/fonts/truetype/hack/Hack-Regular.ttf",
+    "/usr/share/fonts/truetype/inconsolata/Inconsolata-Bold.ttf",
+    "/usr/share/fonts/truetype/inconsolata/Inconsolata-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoMono-Regular.ttf",
+    "/usr/share/fonts/truetype/ubuntu/UbuntuMono-B.ttf",
+]
+
+
+def find_font(custom_path=None):
+    """Return a path to a usable TTF font, or exit with a helpful message."""
+    if custom_path:
+        if not Path(custom_path).exists():
+            sys.exit(f"Font not found: {custom_path}")
+        return custom_path
+    for path in _FONT_CANDIDATES:
+        if Path(path).exists():
+            return path
+    sys.exit(
+        "No suitable font found. Install one with:\n"
+        "  sudo apt install fonts-hack        (recommended — has slashed zero)\n"
+        "  sudo apt install fonts-dejavu-core (fallback)\n"
+        "Or specify a font with --font /path/to/font.ttf"
+    )
+
+
+def lookup_callsign(callsign, db_path):
+    """Return (name, city, state) from hamdat DB, or (None, None, None)."""
+    db = Path(db_path)
+    if not db.exists():
+        print(f"Warning: database not found at {db}", file=sys.stderr)
+        return None, None, None
+
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        """
+        SELECT e.first_name, e.mi, e.last_name, e.entity_name, e.city, e.state
+          FROM license_header h
+          JOIN entity e ON e.unique_system_identifier = h.unique_system_identifier
+         WHERE h.call_sign = ?
+           AND (e.entity_type = 'L' OR e.entity_type = '')
+         ORDER BY h.rowid DESC,
+                  CASE WHEN e.entity_type = 'L' THEN 0 ELSE 1 END
+         LIMIT 1
+        """,
+        (callsign.strip().upper(),),
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return None, None, None
+
+    parts = [row["first_name"] or "", row["mi"] or "", row["last_name"] or ""]
+    name = " ".join(p.strip().title() for p in parts if p and p.strip())
+    if not name:
+        name = (row["entity_name"] or "").strip().title()
+
+    city  = (row["city"]  or "").strip().title()
+    state = (row["state"] or "").strip().upper()
+    return name or None, city or None, state or None
+
+
+def _render_callsign_gf(callsign, font_path, avail_w, max_h, padding=10):
+    """Render the callsign as a 90°-rotated ZPL ^GF graphic field string.
+
+    Finds the largest font size that fits within avail_w × max_h (in landscape
+    dot-space), renders the text centered on a white canvas, rotates the canvas
+    90° clockwise, and returns (gf_command_string, landscape_height_used).
+
+    avail_w  – available landscape width in dots (physical label height - side margins)
+    max_h    – maximum landscape height in dots (available physical-X budget)
+
+    Rotation model: the physical label is 4"×6" (portrait). All content is
+    designed in landscape space and stored rotated 90° CW on the physical paper.
+    When the label is turned 90° CCW to wear/read, everything appears upright.
+    """
+    inner_w = avail_w - padding * 2
+    inner_h = max_h   - padding * 2
+
+    # Binary-search for the largest point size whose bounding box fits both limits.
+    lo, hi = 8, inner_h
+    best_size = lo
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        font = ImageFont.truetype(font_path, mid)
+        bbox = font.getbbox(callsign)       # (left, top, right, bottom)
+        if (bbox[2] - bbox[0]) <= inner_w and (bbox[3] - bbox[1]) <= inner_h:
+            best_size = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    font = ImageFont.truetype(font_path, best_size)
+    bbox = font.getbbox(callsign)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+
+    # Canvas: full avail_w wide × (text height + padding) tall, white background.
+    canvas_h = th + padding * 2
+    img = Image.new("1", (avail_w, canvas_h), 1)       # 1 = white
+    draw = ImageDraw.Draw(img)
+    x = (avail_w - tw) // 2 - bbox[0]                  # center horizontally
+    y = padding - bbox[1]                               # respect ascent offset
+    draw.text((x, y), callsign, fill=0, font=font)      # 0 = black
+
+    # Rotate 90° clockwise so it prints correctly on the physical label.
+    # Physical label turned 90° CCW when worn → text reads normally in landscape.
+    rotated = img.rotate(-90, expand=True)
+    # After rotation: rotated.size = (canvas_h, avail_w)
+    # Physical-X extent = canvas_h  (= landscape height consumed)
+    # Physical-Y extent = avail_w   (= landscape width, spans margin to margin)
+
+    # Convert to ZPL ^GF ASCII hex.
+    # PIL mode-1: white=1 bit, black=0 bit → invert so ZPL 1=printed dot.
+    rw, _ = rotated.size          # rw = canvas_h (physical-X width of image)
+    bytes_per_row = (rw + 7) // 8
+    raw      = rotated.tobytes()
+    inverted = bytes(b ^ 0xFF for b in raw)
+    total    = len(inverted)
+    hex_data = inverted.hex().upper()
+
+    gf = f"^GFA,{total},{total},{bytes_per_row},{hex_data}"
+    return gf, canvas_h
+
+
+def make_zpl(callsign, name, location, banner=None, note=None, dpi=203, font_path=None):
+    """Generate ZPL for a landscape name badge on 4"×6" label stock.
+
+    Physical label: 4" wide (print width) × 6" long (feed direction).
+    All ZPL text elements use ^A0R (rotate 90° CW).
+    The callsign is a ^GF bitmap rendered via Pillow and also rotated 90° CW.
+
+    Coordinate model:
+      land_y  — landscape-Y cursor from the landscape top (in dots).
+      phys_x  = phys_w - land_y - element_height  (converts landscape→physical).
+      Landscape centering (left↔right) uses ^FB across the full physical height.
+    """
+    phys_w = round(4 * dpi)    # physical label width  (4 inches)
+    phys_h = round(6 * dpi)    # physical label length (6 inches)
+
+    margin_top    = round(0.17 * dpi)
+    margin_bottom = round(0.17 * dpi)
+    margin_side   = round(0.20 * dpi)
+    div_thick = 4
+
+    lines = [
+        "^XA",
+        "^CI28",
+        f"^PW{phys_w}",
+        f"^LL{phys_h}",
+        "^LH0,0",
+        f"^FO10,10^GB{phys_w - 20},{phys_h - 20},3^FS",
+    ]
+
+    land_y = margin_top
+
+    def add_text(h, w, text):
+        """Append a centered, R-rotated ^A0 text field and advance land_y."""
+        nonlocal land_y
+        phys_x = phys_w - land_y - h
+        if phys_x >= 0:
+            lines.append(
+                f"^FO{phys_x},0^FB{phys_h},1,0,C,0^A0R,{h},{w}^FD{text}^FS"
+            )
+        land_y += h
+
+    def add_divider():
+        """Append a landscape-horizontal divider line and advance land_y."""
+        nonlocal land_y
+        phys_x = phys_w - land_y - div_thick
+        if phys_x >= 0:
+            lines.append(
+                f"^FO{phys_x},{margin_side}"
+                f"^GB{div_thick},{phys_h - 2 * margin_side},{div_thick}^FS"
+            )
+        land_y += div_thick
+
+    # ── Banner (optional) ────────────────────────────────────────────────────
+    if banner:
+        add_text(round(0.24 * dpi), round(0.21 * dpi), banner)
+        land_y += round(0.07 * dpi)
+        add_divider()
+        land_y += round(0.07 * dpi)
+
+    # ── Callsign (Pillow bitmap) ──────────────────────────────────────────────
+    # Compute the space budget: everything below the callsign zone.
+    reserved_below = (
+        round(0.10 * dpi) + div_thick + round(0.09 * dpi)          # gap+divider+gap
+        + round(0.37 * dpi) + round(0.07 * dpi)                     # name + gap
+        + (round(0.31 * dpi) if location else 0)                    # location
+        + (round(0.27 * dpi) + round(0.07 * dpi) if note else 0)   # note + gap
+        + margin_bottom
+    )
+    avail_w = phys_h - 2 * margin_side          # landscape width for the graphic
+    max_h   = phys_w - land_y - reserved_below  # landscape height budget
+
+    gf, call_h = _render_callsign_gf(callsign, font_path, avail_w, max_h)
+    phys_x = phys_w - land_y - call_h
+    if phys_x >= 0:
+        lines.append(f"^FO{phys_x},{margin_side}{gf}^FS")
+    land_y += call_h
+
+    land_y += round(0.10 * dpi)
+    add_divider()
+    land_y += round(0.09 * dpi)
+
+    # ── Name ─────────────────────────────────────────────────────────────────
+    add_text(round(0.37 * dpi), round(0.32 * dpi), name)
+    land_y += round(0.07 * dpi)
+
+    # ── Location ─────────────────────────────────────────────────────────────
+    if location:
+        add_text(round(0.31 * dpi), round(0.27 * dpi), location)
+
+    # ── Note (pinned to landscape bottom) ────────────────────────────────────
+    if note:
+        note_phys_x = margin_bottom
+        lines.append(
+            f"^FO{note_phys_x},0"
+            f"^FB{phys_h},1,0,C,0"
+            f"^A0R,{round(0.27 * dpi)},{round(0.23 * dpi)}"
+            f"^FD{note}^FS"
+        )
+
+    lines.append("^XZ")
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate a ZPL name badge label for a Zebra thermal printer. "
+            "Produces landscape output on standard 4\"×6\" label stock."
+        )
+    )
+    parser.add_argument(
+        "--call", metavar="CALLSIGN",
+        help="HAM callsign to look up in the hamdat database",
+    )
+    parser.add_argument(
+        "--name", metavar="NAME",
+        help="Operator name — overrides the database value",
+    )
+    parser.add_argument(
+        "--location", metavar="TEXT",
+        help="Location line, e.g. 'Hoboken, NJ' — overrides the database value",
+    )
+    parser.add_argument(
+        "--banner", metavar="TEXT",
+        help="Banner text at the top of the badge, e.g. 'HAMFEST VOLUNTEER'",
+    )
+    parser.add_argument(
+        "--note", metavar="TEXT",
+        help="Small text pinned to the bottom of the badge",
+    )
+    parser.add_argument(
+        "--font", metavar="FILE",
+        help="TrueType font for the callsign (auto-detected if omitted; "
+             "install fonts-hack for a slashed zero)",
+    )
+    parser.add_argument(
+        "--db", metavar="PATH", default=str(DB_DEFAULT),
+        help=f"hamdat SQLite database path (default: {DB_DEFAULT})",
+    )
+    parser.add_argument(
+        "--dpi", type=int, choices=[203, 300], default=203,
+        help="Printer DPI — 203 (default) or 300",
+    )
+    parser.add_argument(
+        "--output", metavar="FILE",
+        help="Write ZPL to FILE instead of stdout",
+    )
+    parser.add_argument(
+        "--printer", metavar="DEVICE", nargs="?", const="/dev/usb/lp0",
+        help="Send ZPL directly to a USB Zebra printer (default: /dev/usb/lp0)",
+    )
+    args = parser.parse_args()
+
+    if not args.call and not args.name:
+        parser.error("--call and/or --name is required")
+
+    callsign = (args.call or "").upper().strip()
+    name     = args.name
+    location = args.location
+
+    if callsign:
+        db_name, db_city, db_state = lookup_callsign(callsign, args.db)
+        if not name and db_name:
+            name = db_name
+        if not location and (db_city or db_state):
+            location = ", ".join(p for p in [db_city, db_state] if p)
+        if not any([db_name, db_city, db_state]):
+            print(f"Warning: {callsign} not found in database", file=sys.stderr)
+
+    if not name:
+        name = callsign or "(unknown)"
+
+    display_call = callsign if callsign else name
+    font_path    = find_font(args.font)
+
+    zpl = make_zpl(
+        display_call, name, location,
+        banner=args.banner,
+        note=args.note,
+        dpi=args.dpi,
+        font_path=font_path,
+    )
+
+    if args.output:
+        Path(args.output).write_text(zpl)
+        print(f"ZPL written to {args.output}", file=sys.stderr)
+
+    if args.printer:
+        device = Path(args.printer)
+        if not device.exists():
+            sys.exit(
+                f"Printer device not found: {args.printer}\n"
+                "Check that the printer is connected and powered on.\n"
+                "You may need: sudo chmod a+rw /dev/usb/lp0"
+            )
+        try:
+            with open(device, "wb") as f:
+                f.write(zpl.encode("utf-8"))
+            print(f"Sent to {device}", file=sys.stderr)
+        except PermissionError:
+            sys.exit(
+                f"Permission denied: {device}\n"
+                f"Fix with:  sudo usermod -aG lp {os.getlogin()}\n"
+                "Then log out and back in, or run:  sudo chmod a+rw /dev/usb/lp0"
+            )
+        except OSError as exc:
+            sys.exit(f"Error sending to printer: {exc}")
+
+    if not args.output and not args.printer:
+        print(zpl)
+
+
+if __name__ == "__main__":
+    main()
