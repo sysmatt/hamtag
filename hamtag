@@ -13,6 +13,7 @@ Author: Matt Hoskins, K2TTA
 
 import argparse
 import os
+import socket
 import sqlite3
 import sys
 from pathlib import Path
@@ -226,10 +227,25 @@ def label_image_to_zpl(img, dpi=203, label="4x6"):
     ])
 
 
-def _send_to_printer(zpl, device_path):
-    """Write ZPL bytes to a printer device. Raises OSError / PermissionError."""
-    with open(device_path, "wb") as f:
-        f.write(zpl.encode())
+def _is_network_printer(target):
+    """Return True if target looks like a hostname or IP rather than a device path."""
+    return not str(target).startswith("/")
+
+
+def _send_to_printer(zpl, target, timeout=10):
+    """Send ZPL to a USB device path or a network printer (host[:port], default port 9100)."""
+    if _is_network_printer(target):
+        target = str(target)
+        if ":" in target:
+            host, port = target.rsplit(":", 1)
+            port = int(port)
+        else:
+            host, port = target, 9100
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.sendall(zpl.encode())
+    else:
+        with open(target, "wb") as f:
+            f.write(zpl.encode())
 
 
 def run_gui(args):
@@ -384,16 +400,17 @@ def run_gui(args):
         except Exception as exc:
             status_var.set(f"Render error: {exc}")
             return
-        device = Path(printer_device)
-        if not device.exists():
-            messagebox.showerror(
-                "Printer not found",
-                f"Device not found: {printer_device}\n"
-                "Is the printer connected and powered on?",
-            )
-            return
+        if not _is_network_printer(printer_device):
+            device = Path(printer_device)
+            if not device.exists():
+                messagebox.showerror(
+                    "Printer not found",
+                    f"Device not found: {printer_device}\n"
+                    "Is the printer connected and powered on?",
+                )
+                return
         try:
-            _send_to_printer(zpl, device)
+            _send_to_printer(zpl, printer_device)
         except PermissionError:
             messagebox.showerror(
                 "Permission denied",
@@ -503,8 +520,9 @@ def main():
         help="Write ZPL to FILE instead of stdout",
     )
     parser.add_argument(
-        "--printer", metavar="DEVICE", nargs="?", const="/dev/usb/lp0",
-        help="Send ZPL directly to a USB Zebra printer (default: /dev/usb/lp0)",
+        "--printer", metavar="TARGET", nargs="?", const="/dev/usb/lp0",
+        help="Send ZPL to a printer — USB device path (default: /dev/usb/lp0) "
+             "or network host[:port] (default port 9100), e.g. 192.168.1.100 or printer.local:9100",
     )
     parser.add_argument(
         "--gui", action="store_true",
@@ -555,19 +573,21 @@ def main():
         print(f"ZPL written to {args.output}", file=sys.stderr)
 
     if args.printer:
-        device = Path(args.printer)
-        if not device.exists():
-            sys.exit(
-                f"Printer device not found: {args.printer}\n"
-                "Check that the printer is connected and powered on.\n"
-                "You may need: sudo chmod a+rw /dev/usb/lp0"
-            )
+        target = args.printer
+        if not _is_network_printer(target):
+            device = Path(target)
+            if not device.exists():
+                sys.exit(
+                    f"Printer device not found: {target}\n"
+                    "Check that the printer is connected and powered on.\n"
+                    "You may need: sudo chmod a+rw /dev/usb/lp0"
+                )
         try:
-            _send_to_printer(zpl, device)
-            print(f"Sent to {device}", file=sys.stderr)
+            _send_to_printer(zpl, target)
+            print(f"Sent to {target}", file=sys.stderr)
         except PermissionError:
             sys.exit(
-                f"Permission denied: {device}\n"
+                f"Permission denied: {target}\n"
                 f"Fix with:  sudo usermod -aG lp {os.getlogin()}\n"
                 "Then log out and back in, or run:  sudo chmod a+rw /dev/usb/lp0"
             )

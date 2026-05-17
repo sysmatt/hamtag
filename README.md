@@ -81,7 +81,7 @@ hamtag [--call CALLSIGN] [--name NAME] [--location TEXT]
 | `--db PATH` | hamdat SQLite database path (default: `~/.hamdat/hamdat.db`) |
 | `--font FILE` | TrueType font for all text (auto-detected if omitted) |
 | `--output FILE` | Save ZPL to a file |
-| `--printer [DEVICE]` | Send ZPL directly to USB printer (default device: `/dev/usb/lp0`) |
+| `--printer [TARGET]` | Send ZPL to a USB device (default: `/dev/usb/lp0`) or network printer (`host[:port]`, default port 9100) |
 | `--gui` | Launch interactive GUI — other flags pre-fill the form |
 
 At least one of `--call` or `--name` is required in CLI mode.
@@ -138,8 +138,9 @@ hamtag --call K2TTA --banner "VOLUNTEER" --output badge.zpl
 # Save to file AND send to printer in one shot
 hamtag --call K2TTA --banner "ELMERFEST 2026" --output badge.zpl --printer
 
-# Network printer (pipe to netcat)
-hamtag --call K2TTA --banner "VOLUNTEER" | nc 192.168.1.100 9100
+# Network printer (auto-detected by hostname/IP)
+hamtag --call K2TTA --banner "VOLUNTEER" --printer 192.168.1.100
+hamtag --call K2TTA --banner "VOLUNTEER" --printer printer.local:9100
 
 # 300 DPI printer
 hamtag --call K2TTA --dpi 300 --printer
