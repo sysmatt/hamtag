@@ -162,14 +162,14 @@ bitmap and rotated 90° clockwise, so the badge reads correctly in landscape ori
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                  HAMFEST VOLUNTEER                        │  ← --banner
+│                  HAMFEST VOLUNTEER                       │  ← --banner
 │  ──────────────────────────────────────────────────────  │
-│                       K2TTA                               │  ← callsign (large, auto-sized)
+│                       K2TTA                              │  ← callsign (large, auto-sized)
 │  ──────────────────────────────────────────────────────  │
-│                  Matthew E Hoskins                        │  ← name
-│                    Lafayette, NJ                          │  ← city, state
-│                                                           │
-│                  ARRL Field Day 2026                      │  ← --note
+│                  Matthew E Hoskins                       │  ← name
+│                    Lafayette, NJ                         │  ← city, state
+│                                                          │
+│                  ARRL Field Day 2026                     │  ← --note
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -184,8 +184,8 @@ Rendered at 4"×2" with no rotation — suitable for smaller adhesive labels or 
 │                  K2TTA                   │  ← callsign (auto-sized)
 │  ──────────────────────────────────────  │
 │           Matthew E Hoskins              │  ← name
-│              Lafayette, NJ              │  ← city, state
-│            ARRL Field Day 2026          │  ← --note
+│              Lafayette, NJ               │  ← city, state
+│            ARRL Field Day 2026           │  ← --note
 └──────────────────────────────────────────┘
 ```
 
