@@ -219,7 +219,9 @@ def label_image_to_zpl(img, dpi=203, label="4x6"):
     inverted = bytes(b ^ 0xFF for b in raw)   # PIL white=1 → ZPL 0 (no ink)
     total    = len(inverted)
     hex_data = inverted.hex().upper()
-    return "\n".join([
+    # Preamble: save Label Top and non-continuous media type to NVRAM before printing.
+    config = "^XA^LT0^MNN^JUS^XZ\n"
+    label  = "\n".join([
         "^XA",
         f"^PW{phys_w}",
         f"^LL{phys_h}",
@@ -227,6 +229,7 @@ def label_image_to_zpl(img, dpi=203, label="4x6"):
         f"^FO0,0^GFA,{total},{total},{bytes_per_row},{hex_data}^FS",
         "^XZ",
     ])
+    return config + label
 
 
 def _is_network_printer(target):
