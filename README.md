@@ -2,6 +2,10 @@
 
 **Author:** Matt Hoskins, K2TTA — k2tta@arrl.net
 
+> **Sister project:** hamtag works hand-in-hand with **hamdat**, which downloads and indexes the FCC
+> amateur license database into a local SQLite file that hamtag looks up callsigns from.
+> https://github.com/sysmatt/hamdat
+
 A command-line tool (with optional GUI) that generates ZPL name badge labels for Zebra thermal printers.
 Looks up HAM callsigns in a [hamdat](https://github.com/sysmatt/hamdat) SQLite database and produces
 labels on standard 4"×6" or 4"×2" label stock.
