@@ -255,20 +255,52 @@ def _send_to_printer(zpl, target, timeout=30):
             f.write(zpl.encode())
 
 
-_CALIBRATE_ZPL = (
+_CALIBRATE_CONFIG_ZPL = (
     "^XA"
     "^MNN"     # non-continuous, web (gap) sensing
     "^LT0"     # reset label-top offset
     "^TA000"   # reset tear-off adjust
-    "^JUS"     # save to NVRAM before calibrating
+    "^JUS"     # save to NVRAM
     "^XZ"
-    "~JC"      # run optical calibration cycle (consumes 2-4 labels)
 )
+
+# USB path: single-shot send (no bidirectional comms on /dev/usb/lp*)
+_CALIBRATE_ZPL = _CALIBRATE_CONFIG_ZPL + "~JC"
+
+
+def _recv_hs(sock):
+    """Read the three-line ~HS host-status response from an open printer socket."""
+    buf = b""
+    while buf.count(b"\x03") < 3:
+        chunk = sock.recv(256)
+        if not chunk:
+            break
+        buf += chunk
+    return buf.decode("ascii", errors="replace")
 
 
 def _send_calibrate(target, timeout=30):
-    """Push non-continuous media settings to NVRAM then run optical calibration (~JC)."""
-    _send_to_printer(_CALIBRATE_ZPL, target, timeout=timeout)
+    """Push non-continuous media settings to NVRAM then run optical calibration (~JC).
+
+    Network printers: uses ~HS status polling between steps so the printer has time
+    to finish each operation (especially the NVRAM write) before the next command arrives.
+    USB printers: single-shot write (no bidirectional comms available on the device node).
+    """
+    if _is_network_printer(target):
+        target = str(target)
+        host, port = (target.rsplit(":", 1) if ":" in target else (target, 9100))
+        port = int(port)
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.sendall(b"~HS\n")                         # confirm printer is ready
+            _recv_hs(sock)
+            sock.sendall(_CALIBRATE_CONFIG_ZPL.encode())   # push settings to NVRAM
+            sock.sendall(b"~HS\n")                         # wait for NVRAM write to settle
+            _recv_hs(sock)
+            sock.sendall(b"~JC\n")                         # trigger calibration cycle
+            sock.shutdown(socket.SHUT_WR)
+    else:
+        _send_to_printer(_CALIBRATE_ZPL, target, timeout=timeout)
 
 
 def run_gui(args):
