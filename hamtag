@@ -237,7 +237,7 @@ def _is_network_printer(target):
     return not str(target).startswith("/")
 
 
-def _send_to_printer(zpl, target, timeout=10):
+def _send_to_printer(zpl, target, timeout=30):
     """Send ZPL to a USB device path or a network printer (host[:port], default port 9100)."""
     if _is_network_printer(target):
         target = str(target)
@@ -247,10 +247,28 @@ def _send_to_printer(zpl, target, timeout=10):
         else:
             host, port = target, 9100
         with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.sendall(zpl.encode())
+            sock.shutdown(socket.SHUT_WR)
     else:
         with open(target, "wb") as f:
             f.write(zpl.encode())
+
+
+_CALIBRATE_ZPL = (
+    "^XA"
+    "^MNN"     # non-continuous, web (gap) sensing
+    "^LT0"     # reset label-top offset
+    "^TA000"   # reset tear-off adjust
+    "^JUS"     # save to NVRAM before calibrating
+    "^XZ"
+    "~JC"      # run optical calibration cycle (consumes 2-4 labels)
+)
+
+
+def _send_calibrate(target, timeout=30):
+    """Push non-continuous media settings to NVRAM then run optical calibration (~JC)."""
+    _send_to_printer(_CALIBRATE_ZPL, target, timeout=timeout)
 
 
 def run_gui(args):
@@ -320,12 +338,14 @@ def run_gui(args):
     btn_row = tk.Frame(form_frame)
     btn_row.grid(row=len(fields_def), column=0, columnspan=2, pady=(12, 0))
 
-    lookup_btn  = tk.Button(btn_row, text="Look Up",  width=12)
+    lookup_btn    = tk.Button(btn_row, text="Look Up",   width=12)
     lookup_btn.pack(side="left", padx=6)
-    print_btn   = tk.Button(btn_row, text="Print It!", width=12, state="disabled")
+    print_btn     = tk.Button(btn_row, text="Print It!", width=12, state="disabled")
     print_btn.pack(side="left", padx=6)
-    default_btn = tk.Button(btn_row, text="Default",  width=10)
+    default_btn   = tk.Button(btn_row, text="Default",   width=10)
     default_btn.pack(side="left", padx=6)
+    calibrate_btn = tk.Button(btn_row, text="Calibrate", width=10)
+    calibrate_btn.pack(side="left", padx=6)
 
     tk.Label(root, textvariable=status_var, anchor="w",
              relief="sunken", bd=1, padx=6).pack(fill="x", side="bottom")
@@ -434,6 +454,16 @@ def run_gui(args):
         print_btn.configure(state="disabled")
         entries["Callsign"].focus_set()
 
+    # ── Calibrate ─────────────────────────────────────────────────────────────
+    def do_calibrate(*_):
+        try:
+            _send_calibrate(printer_device)
+            status_var.set("Calibration sent — printer will feed 2-4 labels.")
+        except OSError as exc:
+            messagebox.showerror("Calibration error", str(exc))
+
+    calibrate_btn.configure(command=do_calibrate)
+
     # ── Default ───────────────────────────────────────────────────────────────
     def do_default(*_):
         call_var.set("")
@@ -530,6 +560,10 @@ def main():
              "or network host[:port] (default port 9100), e.g. 192.168.1.100 or printer.local:9100",
     )
     parser.add_argument(
+        "--calibrate", action="store_true",
+        help="Push non-continuous media settings to NVRAM and run optical label calibration (~JC). Requires --printer.",
+    )
+    parser.add_argument(
         "--gui", action="store_true",
         help="Launch interactive GUI (other flags pre-fill the form)",
     )
@@ -538,6 +572,17 @@ def main():
     # ── GUI mode ──────────────────────────────────────────────────────────────
     if args.gui:
         run_gui(args)
+        return
+
+    # ── Calibrate mode ────────────────────────────────────────────────────────
+    if args.calibrate:
+        if not args.printer:
+            parser.error("--calibrate requires --printer")
+        try:
+            _send_calibrate(args.printer)
+            print(f"Calibration sent to {args.printer} — printer will feed 2-4 labels.", file=sys.stderr)
+        except OSError as exc:
+            sys.exit(f"Error: {exc}")
         return
 
     # ── CLI mode ──────────────────────────────────────────────────────────────

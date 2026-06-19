@@ -68,7 +68,7 @@ hamtag [--call CALLSIGN] [--name NAME] [--location TEXT]
        [--label {4x6,4x2}] [--dpi {203,300}]
        [--db PATH] [--font FILE]
        [--output FILE] [--printer [DEVICE]]
-       [--gui]
+       [--calibrate] [--gui]
 ```
 
 ### Options
@@ -86,9 +86,10 @@ hamtag [--call CALLSIGN] [--name NAME] [--location TEXT]
 | `--font FILE` | TrueType font for all text (auto-detected if omitted) |
 | `--output FILE` | Save ZPL to a file |
 | `--printer [TARGET]` | Send ZPL to a USB device (default: `/dev/usb/lp0`) or network printer (`host[:port]`, default port 9100) |
+| `--calibrate` | Calibrate the printer's label sensor — requires `--printer` (see [Calibration](#calibration)) |
 | `--gui` | Launch interactive GUI — other flags pre-fill the form |
 
-At least one of `--call` or `--name` is required in CLI mode.
+At least one of `--call` or `--name` is required in CLI mode (not needed with `--calibrate` or `--gui`).
 
 ---
 
@@ -109,6 +110,9 @@ The GUI shows a live preview that updates as you type.  The intended workflow at
 **Banner** and **Note** are preserved between badges (they're event-level constants).
 The **Default** button (or **Escape**) restores Banner/Note to the values passed on the command
 line and clears the per-badge fields, ready for the next operator.
+
+The **Calibrate** button sends the calibration sequence to the printer (see [Calibration](#calibration)).
+Run it whenever you load a new roll of labels.
 
 ---
 
@@ -148,6 +152,10 @@ hamtag --call K2TTA --banner "VOLUNTEER" --printer printer.local:9100
 
 # 300 DPI printer
 hamtag --call K2TTA --dpi 300 --printer
+
+# Calibrate the label sensor before loading a new roll (USB or network)
+hamtag --calibrate --printer
+hamtag --calibrate --printer 192.168.1.100
 ```
 
 ---
@@ -203,6 +211,43 @@ hamtag --call K2TTA --banner "TEST" --output preview.zpl
 
 ---
 
+## Calibration
+
+Zebra thermal printers use an optical sensor to detect the gaps between labels and align
+each print correctly.  If labels print in the wrong position — too high, too low, or spanning
+two labels — the sensor needs to be calibrated.
+
+Run calibration whenever you:
+- Load a new roll of labels
+- Switch between label sizes or stock types
+- Find the printer consistently mis-aligning prints
+
+```bash
+# USB
+hamtag --calibrate --printer
+
+# Network
+hamtag --calibrate --printer 192.168.1.100
+```
+
+In the GUI, click the **Calibrate** button at any time.
+
+The calibration sequence pushes the following settings to NVRAM before running the sensor cycle,
+which prevents the common problem where the printer reverts to continuous-media mode after a
+power cycle:
+
+| ZPL command | Effect |
+|---|---|
+| `^MNN` | Non-continuous media, web (gap) sensing |
+| `^LT0` | Reset label-top offset to zero |
+| `^TA000` | Reset tear-off position to zero |
+| `^JUS` | Save all settings to NVRAM |
+| `~JC` | Run optical calibration cycle |
+
+The printer will feed 2–4 labels during the calibration cycle — this is normal.
+
+---
+
 ## Printer notes
 
 - Default DPI is **203**, which is correct for the Zebra LP2844, GX420d, ZD420, and most
@@ -211,3 +256,20 @@ hamtag --call K2TTA --banner "TEST" --output preview.zpl
   is irrelevant — any TTF font installed on the host machine can be used.
 - To send multiple badges in a single print job, concatenate ZPL outputs — each `^XA...^XZ`
   block is one label.
+- Each label job also sends a short config preamble (`^MNN ^LT0 ^JUS`) to ensure non-continuous
+  gap sensing is active and saved, even if the printer was previously in continuous mode.
+
+### Network printing
+
+Network printers are auto-detected when `--printer` is given a hostname or IP address (anything
+that doesn't start with `/`).  The default port is **9100**, which is the standard ZPL raw port
+on all Zebra models.
+
+```bash
+hamtag --call K2TTA --printer 192.168.1.100        # default port 9100
+hamtag --call K2TTA --printer printer.local:9100   # explicit port
+```
+
+The network socket uses a **30-second timeout** and `TCP_NODELAY` to minimise latency.  If you
+see timeout errors, check that port 9100 is not blocked by a firewall and that the printer is
+not paused or in an error state.
