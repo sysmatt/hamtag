@@ -219,8 +219,11 @@ def label_image_to_zpl(img, dpi=203, label="4x6"):
     inverted = bytes(b ^ 0xFF for b in raw)   # PIL white=1 → ZPL 0 (no ink)
     total    = len(inverted)
     hex_data = inverted.hex().upper()
-    # Preamble: save Label Top and non-continuous media type to NVRAM before printing.
-    config = "^XA^LT0^MNN^JUS^XZ\n"
+    # Preamble: set Label Top and non-continuous (gap) media tracking before printing.
+    # Not saved to NVRAM here (no ^JUS) — that's _send_calibrate's job; writing to
+    # NVRAM before every single label wears flash and adds unconfirmed-write latency
+    # on the USB single-shot path.
+    config = "^XA^LT0^MNY^XZ\n"
     label  = "\n".join([
         "^XA",
         f"^PW{phys_w}",
@@ -257,7 +260,7 @@ def _send_to_printer(zpl, target, timeout=30):
 
 _CALIBRATE_CONFIG_ZPL = (
     "^XA"
-    "^MNN"     # non-continuous, web (gap) sensing
+    "^MNY"     # non-continuous, web (gap) sensing (N would mean continuous media!)
     "^LT0"     # reset label-top offset
     "^TA000"   # reset tear-off adjust
     "^JUS"     # save to NVRAM
@@ -367,8 +370,16 @@ def run_gui(args):
         e.grid(row=i, column=1, sticky="ew", pady=4)
         entries[lbl] = e
 
+    copies_var = tk.StringVar(value=str(max(1, args.copies)))
+    copies_row = len(fields_def)
+    tk.Label(form_frame, text="Copies:", anchor="e", width=9).grid(
+        row=copies_row, column=0, sticky="e", pady=4)
+    copies_spin = tk.Spinbox(form_frame, from_=1, to=99, textvariable=copies_var,
+                              width=5, font=("TkDefaultFont", 11), justify="left")
+    copies_spin.grid(row=copies_row, column=1, sticky="w", pady=4)
+
     btn_row = tk.Frame(form_frame)
-    btn_row.grid(row=len(fields_def), column=0, columnspan=2, pady=(12, 0))
+    btn_row.grid(row=copies_row + 1, column=0, columnspan=2, pady=(12, 0))
 
     lookup_btn    = tk.Button(btn_row, text="Look Up",   width=12)
     lookup_btn.pack(side="left", padx=6)
@@ -452,6 +463,13 @@ def run_gui(args):
             status_var.set("Nothing to print.")
             return
         try:
+            copies = int(copies_var.get())
+            if copies < 1:
+                raise ValueError
+        except ValueError:
+            status_var.set("Copies must be a whole number ≥ 1.")
+            return
+        try:
             pil = make_label_image(cs, nm, loc, ban, nt, dpi, font_path, label)
             zpl = label_image_to_zpl(pil, dpi, label)
         except Exception as exc:
@@ -467,7 +485,7 @@ def run_gui(args):
                 )
                 return
         try:
-            _send_to_printer(zpl, printer_device)
+            _send_to_printer("\n".join([zpl] * copies), printer_device)
         except PermissionError:
             messagebox.showerror(
                 "Permission denied",
@@ -478,7 +496,7 @@ def run_gui(args):
         except OSError as exc:
             messagebox.showerror("Print error", str(exc))
             return
-        status_var.set(f"Printed {cs}  ✓")
+        status_var.set(f"Printed {cs} ×{copies}  ✓" if copies > 1 else f"Printed {cs}  ✓")
         # Reset for next badge — keep banner and note (they're event-level constants)
         call_var.set("")
         name_var.set("")
@@ -503,6 +521,7 @@ def run_gui(args):
         location_var.set("")
         banner_var.set(default_banner)
         note_var.set(default_note)
+        copies_var.set(str(max(1, args.copies)))
         print_btn.configure(state="disabled")
         status_var.set("Restored defaults — enter a callsign.")
         entries["Callsign"].focus_set()
@@ -546,8 +565,9 @@ def main():
         )
     )
     parser.add_argument(
-        "--call", metavar="CALLSIGN",
-        help="HAM callsign to look up in the hamdat database",
+        "--call", metavar="CALLSIGN", nargs="+",
+        help="One or more HAM callsigns to look up in the hamdat database "
+             "(space- and/or comma-delimited, e.g. --call K2TTA W1AW or --call K2TTA,W1AW)",
     )
     parser.add_argument(
         "--name", metavar="NAME",
@@ -592,6 +612,10 @@ def main():
              "or network host[:port] (default port 9100), e.g. 192.168.1.100 or printer.local:9100",
     )
     parser.add_argument(
+        "--copies", type=int, default=1,
+        help="Number of copies to print of each badge, sequentially (default: 1)",
+    )
+    parser.add_argument(
         "--calibrate", action="store_true",
         help="Push non-continuous media settings to NVRAM and run optical label calibration (~JC). Requires --printer.",
     )
@@ -601,8 +625,22 @@ def main():
     )
     args = parser.parse_args()
 
+    calls = []
+    for token in (args.call or []):
+        for part in token.replace(",", " ").split():
+            cs = part.strip().upper()
+            if cs:
+                calls.append(cs)
+    args.call = calls[0] if calls else None  # single-callsign consumers (GUI) see the first
+
+    if args.copies < 1:
+        parser.error("--copies must be at least 1")
+
     # ── GUI mode ──────────────────────────────────────────────────────────────
     if args.gui:
+        if len(calls) > 1:
+            print(f"Note: GUI mode only pre-fills the first callsign ({calls[0]}); "
+                  f"the other {len(calls) - 1} were ignored.", file=sys.stderr)
         run_gui(args)
         return
 
@@ -618,40 +656,49 @@ def main():
         return
 
     # ── CLI mode ──────────────────────────────────────────────────────────────
-    if not args.call and not args.name:
+    if not calls and not args.name:
         parser.error("--call and/or --name is required (or use --gui)")
 
-    callsign = (args.call or "").upper().strip()
-    name     = args.name
-    location = args.location
+    if len(calls) > 1 and (args.name or args.location):
+        parser.error("--name/--location cannot be combined with multiple --call values")
 
-    if callsign:
-        db_name, db_city, db_state = lookup_callsign(callsign, args.db)
-        if not name and db_name:
-            name = db_name
-        if not location and (db_city or db_state):
-            location = ", ".join(p for p in [db_city, db_state] if p)
-        if not any([db_name, db_city, db_state]):
-            print(f"Warning: {callsign} not found in database", file=sys.stderr)
+    font_path = find_font(args.font)
+    entries   = calls if calls else [None]  # None → single manual badge from --name
 
-    if not name:
-        name = callsign or "(unknown)"
+    zpl_blocks = []
+    for callsign in entries:
+        name     = args.name
+        location = args.location
 
-    display_call = callsign if callsign else name
-    font_path    = find_font(args.font)
+        if callsign:
+            db_name, db_city, db_state = lookup_callsign(callsign, args.db)
+            if not name and db_name:
+                name = db_name
+            if not location and (db_city or db_state):
+                location = ", ".join(p for p in [db_city, db_state] if p)
+            if not any([db_name, db_city, db_state]):
+                print(f"Warning: {callsign} not found in database", file=sys.stderr)
 
-    img = make_label_image(
-        display_call, name, location,
-        banner=args.banner,
-        note=args.note,
-        dpi=args.dpi,
-        font_path=font_path,
-        label=args.label,
-    )
-    zpl = label_image_to_zpl(img, args.dpi, args.label)
+        if not name:
+            name = callsign or "(unknown)"
+
+        display_call = callsign if callsign else name
+
+        img = make_label_image(
+            display_call, name, location,
+            banner=args.banner,
+            note=args.note,
+            dpi=args.dpi,
+            font_path=font_path,
+            label=args.label,
+        )
+        zpl = label_image_to_zpl(img, args.dpi, args.label)
+        zpl_blocks.extend([zpl] * args.copies)
+
+    all_zpl = "\n".join(zpl_blocks)
 
     if args.output:
-        Path(args.output).write_text(zpl)
+        Path(args.output).write_text(all_zpl)
         print(f"ZPL written to {args.output}", file=sys.stderr)
 
     if args.printer:
@@ -665,7 +712,7 @@ def main():
                     "You may need: sudo chmod a+rw /dev/usb/lp0"
                 )
         try:
-            _send_to_printer(zpl, target)
+            _send_to_printer(all_zpl, target)
             print(f"Sent to {target}", file=sys.stderr)
         except PermissionError:
             sys.exit(
@@ -677,7 +724,7 @@ def main():
             sys.exit(f"Error sending to printer: {exc}")
 
     if not args.output and not args.printer:
-        print(zpl)
+        print(all_zpl)
 
 
 if __name__ == "__main__":

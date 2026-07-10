@@ -259,6 +259,28 @@ The printer will feed 2–4 labels during the calibration cycle — this is norm
 - Each label job also sends a short config preamble (`^MNN ^LT0 ^JUS`) to ensure non-continuous
   gap sensing is active and saved, even if the printer was previously in continuous mode.
 
+### `/dev/usb/lp0` disappears shortly after plugging in
+
+On Ubuntu/Debian systems with `system-config-printer-udev` installed, plugging in the printer
+triggers a udev rule (`/lib/udev/rules.d/70-printers.rules`) that runs
+`configure-printer@usb-<bus>-<dev>.service` → `udev-configure-printer`. That helper probes the
+USB device to auto-create/refresh a CUPS queue, and the probe transiently claims the USB
+interface — which evicts the kernel's `usblp` driver out from under `/dev/usb/lp0`. `dmesg` will
+show `usblpN: removed` a second or two after the device is detected, sometimes followed by
+repeated remove/re-add cycles (and `apparmor="DENIED" ... capname="net_admin"` from `cupsd`'s USB
+backend during the same probe — a side effect, not the cause).
+
+Fix: stop udev from invoking the CUPS auto-configure helper on USB printer hotplug —
+
+```bash
+sudo systemctl mask configure-printer@.service
+```
+
+This is reversible (`sudo systemctl unmask configure-printer@.service`) and doesn't touch any
+CUPS queues you already have — it just stops CUPS from grabbing the device every time it's
+plugged in, leaving `/dev/usb/lp0` free for hamtag's raw writes. Unplug/replug the printer after
+masking to confirm the device path stays put.
+
 ### Network printing
 
 Network printers are auto-detected when `--printer` is given a hostname or IP address (anything
