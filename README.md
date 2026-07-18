@@ -63,11 +63,12 @@ sudo chmod a+rw /dev/usb/lp0
 ## Usage
 
 ```
-hamtag [--call CALLSIGN] [--name NAME] [--location TEXT]
+hamtag [--call CALLSIGN [CALLSIGN ...]] [--name NAME] [--location TEXT]
        [--banner TEXT] [--note TEXT]
        [--label {4x6,4x2}] [--dpi {203,300}]
        [--db PATH] [--font FILE]
        [--output FILE] [--printer [DEVICE]]
+       [--copies N] [--blankevery N]
        [--calibrate] [--gui]
 ```
 
@@ -75,7 +76,7 @@ hamtag [--call CALLSIGN] [--name NAME] [--location TEXT]
 
 | Flag | Description |
 |---|---|
-| `--call CALLSIGN` | HAM callsign to look up in the hamdat database |
+| `--call CALLSIGN [CALLSIGN ...]` | One or more HAM callsigns to look up in the hamdat database (space- and/or comma-delimited, e.g. `--call K2TTA W1AW` or `--call K2TTA,W1AW`) |
 | `--name NAME` | Operator name — overrides the database value |
 | `--location TEXT` | Location line, e.g. `Hoboken, NJ` — overrides the database value |
 | `--banner TEXT` | Banner text at the top of the badge (e.g. `HAMFEST VOLUNTEER`) |
@@ -86,6 +87,8 @@ hamtag [--call CALLSIGN] [--name NAME] [--location TEXT]
 | `--font FILE` | TrueType font for all text (auto-detected if omitted) |
 | `--output FILE` | Save ZPL to a file |
 | `--printer [TARGET]` | Send ZPL to a USB device (default: `/dev/usb/lp0`) or network printer (`host[:port]`, default port 9100) |
+| `--copies N` | Number of copies to print of each badge, sequentially (default: `1`) |
+| `--blankevery N` | Print a blank (unprinted) label after every `N` labels, to mark break points for stapling a long run into a book — counts every printed label, including repeated `--copies` |
 | `--calibrate` | Calibrate the printer's label sensor — requires `--printer` (see [Calibration](#calibration)) |
 | `--gui` | Launch interactive GUI — other flags pre-fill the form |
 
@@ -156,6 +159,13 @@ hamtag --call K2TTA --dpi 300 --printer
 # Calibrate the label sensor before loading a new roll (USB or network)
 hamtag --calibrate --printer
 hamtag --calibrate --printer 192.168.1.100
+
+# Batch-print a roster and staple it into a book, with a blank label
+# every 10 badges marking where to fold/staple
+hamtag --call K2TTA W1AW N2XYZ --printer --blankevery 10
+
+# Print 20 copies of one badge, broken into blank-separated stacks of 5
+hamtag --call K2TTA --copies 20 --blankevery 5 --printer
 ```
 
 ---
