@@ -252,6 +252,23 @@ def label_image_to_zpl(img, dpi=203, label="4x6"):
     return config + label
 
 
+def make_blank_zpl(dpi=203, label="4x6"):
+    """Return ZPL for an unprinted label of the correct physical size.
+
+    Used by --blankevery to feed a blank separator into long print runs.
+    """
+    cfg = _LABEL_CFG[label]
+    phys_w = round((cfg["lh_in"] if cfg["rotate"] else cfg["lw_in"]) * dpi)
+    phys_h = round((cfg["lw_in"] if cfg["rotate"] else cfg["lh_in"]) * dpi)
+    return "\n".join([
+        "^XA",
+        f"^PW{phys_w}",
+        f"^LL{phys_h}",
+        "^LH0,0",
+        "^XZ",
+    ])
+
+
 def _is_network_printer(target):
     """Return True if target looks like a hostname or IP rather than a device path."""
     return not str(target).startswith("/")
@@ -633,6 +650,11 @@ def main():
         help="Number of copies to print of each badge, sequentially (default: 1)",
     )
     parser.add_argument(
+        "--blankevery", type=int, metavar="N",
+        help="Print a blank label after every N labels, to mark break points "
+             "for stapling a long run into a book",
+    )
+    parser.add_argument(
         "--calibrate", action="store_true",
         help="Push non-continuous media settings to NVRAM and run optical label calibration (~JC). Requires --printer.",
     )
@@ -652,6 +674,9 @@ def main():
 
     if args.copies < 1:
         parser.error("--copies must be at least 1")
+
+    if args.blankevery is not None and args.blankevery < 1:
+        parser.error("--blankevery must be at least 1")
 
     # ── GUI mode ──────────────────────────────────────────────────────────────
     if args.gui:
@@ -711,6 +736,15 @@ def main():
         )
         zpl = label_image_to_zpl(img, args.dpi, args.label)
         zpl_blocks.extend([zpl] * args.copies)
+
+    if args.blankevery:
+        blank_zpl = make_blank_zpl(args.dpi, args.label)
+        spaced_blocks = []
+        for i, zpl in enumerate(zpl_blocks, start=1):
+            spaced_blocks.append(zpl)
+            if i % args.blankevery == 0 and i != len(zpl_blocks):
+                spaced_blocks.append(blank_zpl)
+        zpl_blocks = spaced_blocks
 
     all_zpl = "\n".join(zpl_blocks)
 
