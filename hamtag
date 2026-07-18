@@ -34,12 +34,14 @@ _LABEL_CFG = {
     "4x6": dict(
         lw_in=6,   lh_in=4,   rotate=True,
         mt=0.17,   mb=0.17,   ms=0.20,  gap=0.07, div=4,
-        banner_h=0.24, name_h=0.37, loc_h=0.31, note_h=0.27, call_pad=0.05,
+        banner_h=0.24, first_name_h=0.48, name_h=0.16, name_gap=0.03,
+        loc_h=0.16, note_h=0.27, call_pad=0.05,
     ),
     "4x2": dict(
         lw_in=4,   lh_in=2,   rotate=False,
         mt=0.13,   mb=0.09,   ms=0.12,  gap=0.04, div=3,
-        banner_h=0.15, name_h=0.20, loc_h=0.17, note_h=0.14, call_pad=0.03,
+        banner_h=0.15, first_name_h=0.26, name_h=0.08, name_gap=0.015,
+        loc_h=0.08, note_h=0.14, call_pad=0.03,
     ),
 }
 
@@ -126,10 +128,15 @@ def make_label_image(callsign, name, location, banner=None, note=None,
     ms  = round(cfg["ms"]      * dpi)
     div = cfg["div"]
     gap = round(cfg["gap"]     * dpi)
+    first_name_h = round(cfg["first_name_h"] * dpi)
     name_h   = round(cfg["name_h"]   * dpi)
+    name_gap = round(cfg["name_gap"] * dpi)
     loc_h    = round(cfg["loc_h"]    * dpi)
     note_h   = round(cfg["note_h"]   * dpi)
     call_pad = round(cfg["call_pad"] * dpi)
+
+    first_name, _, rest_name = name.partition(" ")
+    rest_name = rest_name.strip()
 
     img  = Image.new("RGB", (lw, lh), "white")
     draw = ImageDraw.Draw(img)
@@ -139,7 +146,11 @@ def make_label_image(callsign, name, location, banner=None, note=None,
         """Binary-search for the largest point size fitting max_w × max_h."""
         if max_w is None:
             max_w = lw - 2 * ms
-        lo, hi = 8, max_h
+        # hi is a search ceiling, not a height estimate: glyph bbox height is
+        # typically well under the nominal font size, so capping at max_h alone
+        # would stop the search before width-bound text (e.g. short callsigns)
+        # reaches its true largest size.
+        lo, hi = 8, max(max_h, max_w)
         best = lo
         while lo <= hi:
             mid = (lo + hi) // 2
@@ -173,9 +184,10 @@ def make_label_image(callsign, name, location, banner=None, note=None,
         y += div + gap
 
     # ── Callsign ──────────────────────────────────────────────────────────────
+    name_block_h = first_name_h + (name_gap + name_h if rest_name else 0)
     reserved = (
         gap + div + gap
-        + name_h + gap
+        + name_block_h + gap
         + (loc_h if location else 0)
         + (note_h + gap if note else 0)
         + mb
@@ -190,9 +202,14 @@ def make_label_image(callsign, name, location, banner=None, note=None,
     draw_divider(y)
     y += div + gap
 
-    # ── Name ──────────────────────────────────────────────────────────────────
-    draw_centered(name, fit_font(name, name_h), y)
-    y += name_h + gap
+    # ── Name (first name larger, middle/last name below in the base size) ─────
+    draw_centered(first_name, fit_font(first_name, first_name_h), y)
+    y += first_name_h
+    if rest_name:
+        y += name_gap
+        draw_centered(rest_name, fit_font(rest_name, name_h), y)
+        y += name_h
+    y += gap
 
     # ── Location ──────────────────────────────────────────────────────────────
     if location:
