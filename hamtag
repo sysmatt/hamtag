@@ -12,10 +12,13 @@ Author: Matt Hoskins, K2TTA
 """
 
 import argparse
+import csv
 import os
+import random
 import socket
 import sqlite3
 import sys
+import textwrap
 from pathlib import Path
 
 try:
@@ -114,6 +117,34 @@ def lookup_callsign(callsign, db_path):
     return name or None, city or None, state or None
 
 
+def fit_font(font_path, text, max_h, max_w):
+    """Binary-search for the largest point size fitting max_w × max_h."""
+    # hi is a search ceiling, not a height estimate: glyph bbox height is
+    # typically well under the nominal font size, so capping at max_h alone
+    # would stop the search before width-bound text (e.g. short callsigns)
+    # reaches its true largest size.
+    lo, hi = 8, max(max_h, max_w)
+    best = lo
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        f   = ImageFont.truetype(font_path, mid)
+        bb  = f.getbbox(text)
+        if (bb[2] - bb[0]) <= max_w and (bb[3] - bb[1]) <= max_h:
+            best = mid
+            lo   = mid + 1
+        else:
+            hi = mid - 1
+    return ImageFont.truetype(font_path, best)
+
+
+def draw_centered(draw, lw, text, font, y):
+    """Draw text horizontally centered at y within width lw. Returns rendered text height."""
+    bb = font.getbbox(text)
+    x  = (lw - (bb[2] - bb[0])) // 2 - bb[0]
+    draw.text((x, y - bb[1]), text, fill="black", font=font)
+    return bb[3] - bb[1]
+
+
 def make_label_image(callsign, name, location, banner=None, note=None,
                      dpi=203, font_path=None, label="4x6"):
     """Render the complete label as a PIL RGB Image in reading orientation.
@@ -142,33 +173,11 @@ def make_label_image(callsign, name, location, banner=None, note=None,
     draw = ImageDraw.Draw(img)
     draw.rectangle([10, 10, lw - 11, lh - 11], outline="black", width=3)
 
-    def fit_font(text, max_h, max_w=None):
-        """Binary-search for the largest point size fitting max_w × max_h."""
-        if max_w is None:
-            max_w = lw - 2 * ms
-        # hi is a search ceiling, not a height estimate: glyph bbox height is
-        # typically well under the nominal font size, so capping at max_h alone
-        # would stop the search before width-bound text (e.g. short callsigns)
-        # reaches its true largest size.
-        lo, hi = 8, max(max_h, max_w)
-        best = lo
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            f   = ImageFont.truetype(font_path, mid)
-            bb  = f.getbbox(text)
-            if (bb[2] - bb[0]) <= max_w and (bb[3] - bb[1]) <= max_h:
-                best = mid
-                lo   = mid + 1
-            else:
-                hi = mid - 1
-        return ImageFont.truetype(font_path, best)
+    def ff(text, max_h, max_w=None):
+        return fit_font(font_path, text, max_h, lw - 2 * ms if max_w is None else max_w)
 
-    def draw_centered(text, font, y):
-        """Draw text horizontally centered at y. Returns rendered text height."""
-        bb = font.getbbox(text)
-        x  = (lw - (bb[2] - bb[0])) // 2 - bb[0]
-        draw.text((x, y - bb[1]), text, fill="black", font=font)
-        return bb[3] - bb[1]
+    def dc(text, font, y):
+        return draw_centered(draw, lw, text, font, y)
 
     def draw_divider(y):
         draw.rectangle([ms, y, lw - ms, y + div - 1], fill="black")
@@ -178,7 +187,7 @@ def make_label_image(callsign, name, location, banner=None, note=None,
     # ── Banner (optional) ─────────────────────────────────────────────────────
     if banner:
         bh = round(cfg["banner_h"] * dpi)
-        draw_centered(banner, fit_font(banner, bh), y)
+        dc(banner, ff(banner, bh), y)
         y += bh + gap
         draw_divider(y)
         y += div + gap
@@ -193,9 +202,9 @@ def make_label_image(callsign, name, location, banner=None, note=None,
         + mb
     )
     call_budget = lh - y - reserved
-    f  = fit_font(callsign, call_budget - call_pad * 2,
-                  max_w=lw - 2 * ms - call_pad * 2)
-    th = draw_centered(callsign, f, y + call_pad)
+    f  = ff(callsign, call_budget - call_pad * 2,
+            max_w=lw - 2 * ms - call_pad * 2)
+    th = dc(callsign, f, y + call_pad)
     y += th + call_pad * 2 + gap
 
     # ── Divider ───────────────────────────────────────────────────────────────
@@ -203,22 +212,22 @@ def make_label_image(callsign, name, location, banner=None, note=None,
     y += div + gap
 
     # ── Name (first name larger, middle/last name below in the base size) ─────
-    draw_centered(first_name, fit_font(first_name, first_name_h), y)
+    dc(first_name, ff(first_name, first_name_h), y)
     y += first_name_h
     if rest_name:
         y += name_gap
-        draw_centered(rest_name, fit_font(rest_name, name_h), y)
+        dc(rest_name, ff(rest_name, name_h), y)
         y += name_h
     y += gap
 
     # ── Location ──────────────────────────────────────────────────────────────
     if location:
-        draw_centered(location, fit_font(location, loc_h), y)
+        dc(location, ff(location, loc_h), y)
 
     # ── Note (pinned to bottom) ───────────────────────────────────────────────
     if note:
         note_y = lh - mb - note_h
-        draw_centered(note, fit_font(note, note_h), note_y)
+        dc(note, ff(note, note_h), note_y)
 
     return img
 
@@ -253,20 +262,106 @@ def label_image_to_zpl(img, dpi=203, label="4x6"):
 
 
 def make_blank_zpl(dpi=203, label="4x6"):
-    """Return ZPL for an unprinted label of the correct physical size.
+    """Return ZPL for an all-white (unprinted) label of the correct size.
 
     Used by --blankevery to feed a blank separator into long print runs.
+    Encoded through the same ^GFA graphic path as a real label (rather than
+    a bare ^XA...^XZ) because printers treat a content-less format as a
+    settings-only frame and don't advance/print media for it.
     """
     cfg = _LABEL_CFG[label]
-    phys_w = round((cfg["lh_in"] if cfg["rotate"] else cfg["lw_in"]) * dpi)
-    phys_h = round((cfg["lw_in"] if cfg["rotate"] else cfg["lh_in"]) * dpi)
-    return "\n".join([
-        "^XA",
-        f"^PW{phys_w}",
-        f"^LL{phys_h}",
-        "^LH0,0",
-        "^XZ",
-    ])
+    lw = round(cfg["lw_in"] * dpi)
+    lh = round(cfg["lh_in"] * dpi)
+    blank_img = Image.new("RGB", (lw, lh), "white")
+    return label_image_to_zpl(blank_img, dpi, label)
+
+
+def load_jokes(path):
+    """Load one joke per row from a single-column CSV (header + text rows)."""
+    jokes = []
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            next(reader, None)  # header row
+            for row in reader:
+                if row and row[0].strip():
+                    jokes.append(row[0].strip())
+    except FileNotFoundError:
+        sys.exit(f"Jokes file not found: {path}")
+    if not jokes:
+        sys.exit(f"No jokes found in {path}")
+    return jokes
+
+
+def _wrap_text_block(text, font_path, target_aspect=2.0, working_size=60):
+    """Render word-wrapped text as a tightly-cropped block at a fixed font size.
+
+    Line-wrap width is chosen so the wrapped block roughly matches
+    target_aspect (width/height) for whatever destination it's headed to —
+    e.g. a wide, flat area (like a one-line attribution strip) wants few/no
+    wraps, while a squarish area can take several lines. Getting this right
+    here matters because the caller scales the block to fit its space along
+    whichever dimension is tighter: a block shaped nothing like its
+    destination gets scaled down by the mismatched dimension and ends up
+    smaller than it needs to be, even though the text would easily fit.
+    """
+    # Empirically fit (via _wrap_joke_block's original tuning: wrap_chars =
+    # 3.0*sqrt(len) targeted a 2:1 block), then generalized to any aspect.
+    wrap_chars = max(10, min(80, round((4.5 * target_aspect) ** 0.5 * len(text) ** 0.5)))
+    font = ImageFont.truetype(font_path, working_size)
+    text = "\n".join(textwrap.wrap(text, width=wrap_chars))
+    spacing = round(working_size * 0.35)
+
+    probe = ImageDraw.Draw(Image.new("L", (1, 1)))
+    bbox = probe.multiline_textbbox((0, 0), text, font=font, spacing=spacing, align="center")
+    w, h = round(bbox[2] - bbox[0]), round(bbox[3] - bbox[1])
+
+    block = Image.new("RGB", (w, h), "white")
+    ImageDraw.Draw(block).multiline_text(
+        (-bbox[0], -bbox[1]), text, fill="black", font=font, spacing=spacing, align="center",
+    )
+    return block
+
+
+def make_joke_image(joke, jokenote=None, dpi=203, font_path=None, label="4x6"):
+    """Render a joke as a full label image: wrapped text scaled to fit the
+    label, with an optional small attribution line pinned to the bottom.
+    """
+    cfg = _LABEL_CFG[label]
+    lw = round(cfg["lw_in"] * dpi)
+    lh = round(cfg["lh_in"] * dpi)
+    mt = round(cfg["mt"] * dpi)
+    mb = round(cfg["mb"] * dpi)
+    ms = round(cfg["ms"] * dpi)
+    gap = round(cfg["gap"] * dpi)
+    # 2x the badge's --note size — the jokenote reads better bigger, and
+    # wraps across lines (below) rather than being squeezed onto one.
+    jokenote_h = round(cfg["note_h"] * 2.0 * dpi)
+
+    img = Image.new("RGB", (lw, lh), "white")
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([10, 10, lw - 11, lh - 11], outline="black", width=3)
+
+    note_block_h = (jokenote_h + gap) if jokenote else 0
+    area_w = lw - 2 * ms
+    area_h = lh - mt - mb - note_block_h
+
+    def _fit_block(text, max_w, max_h):
+        block = _wrap_text_block(text, font_path, target_aspect=max_w / max_h)
+        scale = min(max_w / block.width, max_h / block.height)
+        new_w = max(1, round(block.width * scale))
+        new_h = max(1, round(block.height * scale))
+        return block.resize((new_w, new_h), Image.LANCZOS)
+
+    block = _fit_block(joke, area_w, area_h)
+    img.paste(block, ((lw - block.width) // 2, mt + (area_h - block.height) // 2))
+
+    if jokenote:
+        note_block = _fit_block(jokenote, area_w, jokenote_h)
+        note_y = lh - mb - jokenote_h + (jokenote_h - note_block.height) // 2
+        img.paste(note_block, ((lw - note_block.width) // 2, note_y))
+
+    return img
 
 
 def _is_network_printer(target):
@@ -655,6 +750,16 @@ def main():
              "for stapling a long run into a book",
     )
     parser.add_argument(
+        "--jokes", metavar="FILE",
+        help="Path to a single-column jokes CSV (header + one joke per row). "
+             "Prints a random joke label before every badge printed.",
+    )
+    parser.add_argument(
+        "--jokenote", metavar="TEXT",
+        help="Small attribution text pinned to the bottom of each joke label "
+             "(requires --jokes)",
+    )
+    parser.add_argument(
         "--calibrate", action="store_true",
         help="Push non-continuous media settings to NVRAM and run optical label calibration (~JC). Requires --printer.",
     )
@@ -677,6 +782,9 @@ def main():
 
     if args.blankevery is not None and args.blankevery < 1:
         parser.error("--blankevery must be at least 1")
+
+    if args.jokenote and not args.jokes:
+        parser.error("--jokenote requires --jokes")
 
     # ── GUI mode ──────────────────────────────────────────────────────────────
     if args.gui:
@@ -706,6 +814,7 @@ def main():
 
     font_path = find_font(args.font)
     entries   = calls if calls else [None]  # None → single manual badge from --name
+    jokes     = load_jokes(args.jokes) if args.jokes else None
 
     zpl_blocks = []
     for callsign in entries:
@@ -735,15 +844,27 @@ def main():
             label=args.label,
         )
         zpl = label_image_to_zpl(img, args.dpi, args.label)
-        zpl_blocks.extend([zpl] * args.copies)
+
+        for _ in range(args.copies):
+            if jokes:
+                joke_img = make_joke_image(
+                    random.choice(jokes), jokenote=args.jokenote,
+                    dpi=args.dpi, font_path=font_path, label=args.label,
+                )
+                zpl_blocks.append(label_image_to_zpl(joke_img, args.dpi, args.label))
+            zpl_blocks.append(zpl)
 
     if args.blankevery:
         blank_zpl = make_blank_zpl(args.dpi, args.label)
         spaced_blocks = []
         for i, zpl in enumerate(zpl_blocks, start=1):
             spaced_blocks.append(zpl)
-            if i % args.blankevery == 0 and i != len(zpl_blocks):
+            if i % args.blankevery == 0:
                 spaced_blocks.append(blank_zpl)
+        # Always end the run on a blank label, even if the count didn't land
+        # on one, so the last badge in the stack is never left exposed.
+        if not spaced_blocks or spaced_blocks[-1] != blank_zpl:
+            spaced_blocks.append(blank_zpl)
         zpl_blocks = spaced_blocks
 
     all_zpl = "\n".join(zpl_blocks)
