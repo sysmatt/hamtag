@@ -7,8 +7,8 @@
 > https://github.com/sysmatt/hamdat
 
 A command-line tool (with optional GUI) that generates name badge labels for thermal printers —
-ZPL for Zebra printers, or TSPL for TSC-compatible printers such as older MUNBYN thermal label
-printers (see [`--lang tspl` compatibility](#--lang-tspl-compatibility--confirmed-vs-not) for
+ZPL for Zebra printers, or TSPL for TSC-compatible printers such as the MUNBYN ITPP130B
+(see [`--lang tspl` compatibility](#--lang-tspl-compatibility--confirmed-vs-not) for
 which models this actually covers).
 Looks up HAM callsigns in a [hamdat](https://github.com/sysmatt/hamdat) SQLite database and produces
 labels on standard 4"×6" or 4"×2" label stock.
@@ -23,8 +23,8 @@ labels on standard 4"×6" or 4"×2" label stock.
   if it exists, or point at one with `--db PATH` or the `HAMDAT_DB` environment variable  
   *(required for callsign lookup; manual `--name`/`--location` works without it. A `--db`/`HAMDAT_DB`
   path that is missing or can't be opened is a fatal error)*
-- A Zebra thermal label printer (ZPL) or an older-model TSC-compatible MUNBYN thermal printer
-  (TSPL) — **not** the RealWriter 403B, see the TSPL compatibility note below — loaded with
+- A Zebra thermal label printer (ZPL) or a TSC-compatible thermal printer such as the MUNBYN
+  ITPP130B (TSPL) — see the TSPL compatibility note below — loaded with
   4"×6" or 4"×2" label stock
 
 ### GUI mode additional requirements
@@ -71,14 +71,14 @@ sudo chmod a+rw /dev/usb/lp0
 
 ```
 hamtag [--call CALLSIGN [CALLSIGN ...]] [--name NAME] [--location TEXT]
-       [--banner TEXT] [--note TEXT]
+       [--banner TEXT] [--note TEXT] [--note-lookup FILE]
        [--label {4x6,4x2}] [--dpi {203,300}]
        [--db PATH] [--font FILE]
        [--output FILE] [--lang {zpl,tspl}] [--printer [DEVICE]]
        [--darkness 1-16] [--speed 1-8] [--media {gap,bline,continuous}]
-       [--gap-mm MM] [--gap-offset-mm MM]
-       [--copies N] [--blankevery N]
-       [--calibrate] [--gui]
+       [--gap-mm MM] [--gap-offset-mm MM] [--shift-x-mm MM] [--shift-y-mm MM]
+       [--copies N] [--blankevery N] [--jokes FILE] [--jokenote TEXT]
+       [--calibrate] [--ruler] [--gui]
 ```
 
 ### Options
@@ -89,28 +89,35 @@ hamtag [--call CALLSIGN [CALLSIGN ...]] [--name NAME] [--location TEXT]
 | `--name NAME` | Operator name — overrides the database value |
 | `--location TEXT` | Location line, e.g. `Hoboken, NJ` — overrides the database value |
 | `--banner TEXT` | Banner text at the top of the badge (e.g. `HAMFEST VOLUNTEER`) |
-| `--note TEXT` | Small text pinned to the bottom of the badge |
+| `--note TEXT` | Small text pinned to the bottom of the badge — the default when `--note-lookup` has no entry for a callsign |
+| `--note-lookup FILE` | CSV roster of `callsign, note` rows (e.g. `ke2r, Club President`); a listed callsign's note replaces `--note` (see [Per-callsign notes](#per-callsign-notes---note-lookup)) |
 | `--label {4x6,4x2}` | Label stock — `4x6` landscape badge (default) or `4x2` portrait |
 | `--dpi {203,300}` | Printer resolution — `203` (default) or `300` |
 | `--db PATH` | hamdat SQLite database path. If omitted: `$HAMDAT_DB` if set, else `~/.hamdat/hamdat.db` if it exists, else lookup is disabled. A given path that is missing or not a valid hamdat DB exits with an error |
 | `--font FILE` | TrueType font for all text (auto-detected if omitted) |
 | `--output FILE` | Save label data to a file |
-| `--lang {zpl,tspl}` | Printer command language — `zpl` (default, Zebra printers) or `tspl` (TSC-compatible printers, e.g. older MUNBYN models — **not** the RealWriter 403B) |
+| `--lang {zpl,tspl}` | Printer command language — `zpl` (default, Zebra printers) or `tspl` (TSC-compatible printers, e.g. the MUNBYN ITPP130B) |
 | `--printer [TARGET]` | Send label data to a USB device (default: `/dev/usb/lp0`) or network printer (`host[:port]`, default port 9100) |
 | `--darkness 1-16` | TSPL print darkness, `1` (lightest) to `16` (darkest), default `12` (`--lang tspl` only) |
 | `--speed 1-8` | TSPL print speed in inches/sec, `1` to `8`, default `4` (`--lang tspl` only) |
 | `--media {gap,bline,continuous}` | TSPL media sensing mode — `gap` (default), `bline` (black mark), or `continuous` stock (`--lang tspl` only) |
 | `--gap-mm MM` | TSPL gap/black-line height in mm, default `3.0` (`--lang tspl` only) |
 | `--gap-offset-mm MM` | TSPL gap/black-line offset in mm, default `0.0` (`--lang tspl` only) |
+| `--shift-x-mm MM` | Move the printed image across the print head — `+` right, `-` left as the `--ruler` label reads — default `0.0`, range ±25 (`--lang tspl` only; see [Aligning TSPL output](#aligning-tspl-output---ruler)) |
+| `--shift-y-mm MM` | Move the printed image along the feed — `+` down, `-` up as the `--ruler` label reads — default `0.0`, range ±25 (`--lang tspl` only) |
 | `--copies N` | Number of copies to print of each badge, sequentially (default: `1`) |
-| `--blankevery N` | Print a blank (unprinted) label after every `N` labels, to mark break points for stapling a long run into a book — counts every printed label, including repeated `--copies` |
+| `--blankevery N` | Print a blank (unprinted) label after every `N` labels, to mark break points for stapling a long run into a book — counts every printed label, including repeated `--copies` (CLI only) |
+| `--jokes FILE` | Single-column jokes CSV (header row, then one joke per row); a random joke label prints before every badge copy. Works in CLI and GUI |
+| `--jokenote TEXT` | Small attribution text pinned to the bottom of each joke label (requires `--jokes`) |
 | `--calibrate` | Calibrate the printer's label sensor — requires `--printer` (see [Calibration](#calibration)) |
+| `--ruler` | Print an alignment test label with mm rulers along every edge, for measuring `--shift-x-mm`/`--shift-y-mm`; honors `--label`, `--dpi`, `--lang` and the output options, can't be combined with `--call`/`--name` |
 | `--gui` | Launch interactive GUI — other flags pre-fill the form |
 
 `--gui` currently pre-fills from `--lang` and the TSPL tuning flags too, so `hamtag --gui --lang tspl
---printer /dev/usb/lp0` runs the GUI against a TSPL printer.
+--printer /dev/usb/lp0` runs the GUI against a TSPL printer. `--jokes`/`--jokenote` apply in the GUI
+as well (a random joke label prints before each badge copy); `--blankevery` and `--output` are CLI-only.
 
-At least one of `--call` or `--name` is required in CLI mode (not needed with `--calibrate` or `--gui`).
+At least one of `--call` or `--name` is required in CLI mode (not needed with `--calibrate`, `--ruler` or `--gui`).
 
 ---
 
@@ -129,6 +136,8 @@ The GUI shows a live preview that updates as you type.  The intended workflow at
 2. Press **Enter** again (or click **Print It!**) → label prints
 
 **Banner** and **Note** are preserved between badges (they're event-level constants).
+With `--note-lookup`, **Look Up** fills **Note** from the roster (or the `--note` default), the
+status bar shows the roster match, and **Note** resets to the default after each print.
 The **Default** button (or **Escape**) restores Banner/Note to the values passed on the command
 line and clears the per-badge fields, ready for the next operator.
 
@@ -137,11 +146,45 @@ Run it whenever you load a new roll of labels.
 
 ---
 
+## Per-callsign notes (`--note-lookup`)
+
+`--note` sets the default note; `--note-lookup FILE` supplies callsign-specific notes that replace
+it.  Handy for a club roster: members get their role, everyone else gets the default.
+
+```
+# SCARC roster
+callsign,note
+k2tta, Club Member
+ke2r, Club President
+w1xyz, Treasurer, 2025-2026
+```
+
+```bash
+hamtag --call K2TTA KE2R N0CALL --note "Guest" --note-lookup roster.csv --printer
+# K2TTA → "Club Member", KE2R → "Club President", N0CALL → "Guest"
+```
+
+- One `callsign, note` row per line.  Callsigns match case-insensitively; surrounding spaces are ignored.
+- Everything after the first comma is the note, so commas inside a note don't need quoting
+  (quoted CSV fields work too).
+- Blank lines, lines starting with `#`, and a first row of `callsign`/`call` column headers are skipped.
+- A row with no note prints a warning to stderr, and that callsign falls back to `--note`.
+- A callsign listed more than once prints a warning to stderr; the last row wins.
+- A missing or unreadable file, or one with no notes at all, is a fatal error.
+
+Badges without a callsign (`--name` only) always use `--note`.  Works in CLI and GUI, with or
+without the hamdat database.
+
+---
+
 ## Examples
 
 ```bash
 # Interactive GUI with event banner and note pre-filled
 hamtag --gui --banner "HAMFEST VOLUNTEER" --note "ARRL Field Day 2026"
+
+# Club roster notes: listed members get their role, everyone else "Guest"
+hamtag --gui --note "Guest" --note-lookup roster.csv
 
 # Look up K2TTA and print to stdout
 hamtag --call K2TTA
@@ -167,7 +210,7 @@ hamtag --call K2TTA --banner "VOLUNTEER" --output badge.zpl
 # Save to file AND send to printer in one shot
 hamtag --call K2TTA --banner "ELMERFEST 2026" --output badge.zpl --printer
 
-# TSPL printer (older MUNBYN models, TSC-compatible) — USB
+# TSPL printer (e.g. MUNBYN ITPP130B, TSC-compatible) — USB
 hamtag --call K2TTA --banner "VOLUNTEER" --lang tspl --printer /dev/usb/lp0
 
 # TSPL on black-mark stock, darker/slower for dense label art
@@ -290,6 +333,34 @@ For `--lang tspl` printers, calibration instead sends a single `AUTODETECT` comm
 few labels and senses the paper/gap size in one shot — TSPL has no separate NVRAM-save step the
 way ZPL's `^JUS` does.
 
+### Aligning TSPL output (`--ruler`)
+
+Some TSPL printers have a print head wider than 4" stock (e.g. 108 mm) and count position from
+the head's edge rather than the label's, so the image lands a few mm to one side: one edge of the
+badge border is cut off and there's extra white space on the opposite side.  Measure it with the
+ruler label, then correct it with `--shift-x-mm` / `--shift-y-mm`:
+
+```bash
+# 1. Print the ruler (use the same --label you print badges on)
+hamtag --ruler --lang tspl --label 4x2 --printer
+
+# 2. Read the edges: the 0 mm tick of each ruler should sit on the label edge.
+#    If the first visible tick on the left is 3 mm, shift right by 3 mm and re-check:
+hamtag --ruler --lang tspl --label 4x2 --shift-x-mm 3 --printer
+
+# 3. Use the same shift for real badges (CLI or GUI)
+hamtag --gui --lang tspl --label 4x2 --shift-x-mm 3 --printer
+```
+
+Directions are as the ruler label reads: `+x` moves the image right, `+y` moves it down.  The ruler
+prints its current shift values in the centre, so a photo of the label records the setting.
+
+A positive `--shift-x-mm` also widens the TSPL `SIZE` width by the same amount.  These printers
+(confirmed on the MUNBYN ITPP130B) clip at the `SIZE` width counted from their own origin, so
+shifting the image right without it just moves the cut-off to the right edge.  `--shift-y-mm` never
+changes the `SIZE` height, because that's the label length the printer feeds by; it hasn't been
+tested on hardware yet.
+
 ---
 
 ## Printer notes
@@ -311,7 +382,7 @@ way ZPL's `^JUS` does.
 
 ### `--lang tspl` compatibility — confirmed vs. not
 
-`--lang tspl` is confirmed working over raw USB on **older MUNBYN thermal label printer models**
+`--lang tspl` is confirmed working over raw USB on the **MUNBYN ITPP130B**
 (tested end-to-end: 4×6 and 4×2, both print correctly).
 
 **The MUNBYN RealWriter 403B does NOT work with `--lang tspl` — do not spend more time on it.**

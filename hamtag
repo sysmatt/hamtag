@@ -2,8 +2,8 @@
 """hamtag - Generate name badge labels for thermal printers.
 
 Looks up HAM callsigns in a hamdat SQLite database and produces ZPL (Zebra
-printers) or TSPL (TSC-compatible printers, e.g. the MUNBYN RealWriter
-403B) ready to send to a thermal label printer.
+printers) or TSPL (TSC-compatible printers, e.g. the MUNBYN ITPP130B)
+ready to send to a thermal label printer.
 
 Label format: 4"x6" stock rendered as a single PIL bitmap, rotated 90°
 clockwise for landscape orientation (6" wide, 4" tall when worn).
@@ -286,11 +286,26 @@ def make_label_image(callsign, name, location, banner=None, note=None,
     return img
 
 
+def _pad_to_byte_width(img):
+    """Pad a mode "1" image on the right with white to a width divisible by 8.
+
+    PIL packs each row into whole bytes and fills the unused trailing bits
+    with 0, which both TSPL (0 = black) and ZPL (after inversion) print as a
+    black bar just past the right edge of the image.
+    """
+    pad = -img.width % 8
+    if not pad:
+        return img
+    padded = Image.new("1", (img.width + pad, img.height), 1)
+    padded.paste(img, (0, 0))
+    return padded
+
+
 def label_image_to_zpl(img, dpi=203, label="4x6"):
     """Convert a PIL label Image to a ZPL string ready to send to the printer."""
     cfg = _LABEL_CFG[label]
     out = img.rotate(-90, expand=True) if cfg["rotate"] else img
-    out = out.convert("1", dither=Image.Dither.NONE)
+    out = _pad_to_byte_width(out.convert("1", dither=Image.Dither.NONE))
     phys_w = round((cfg["lh_in"] if cfg["rotate"] else cfg["lw_in"]) * dpi)
     phys_h = round((cfg["lw_in"] if cfg["rotate"] else cfg["lh_in"]) * dpi)
     rw, _  = out.size
@@ -331,10 +346,11 @@ def make_blank_zpl(dpi=203, label="4x6"):
 
 
 def label_image_to_tspl(img, dpi=203, label="4x6", darkness=12, speed=4,
-                        media="gap", gap_mm=3.0, gap_offset_mm=0.0):
+                        media="gap", gap_mm=3.0, gap_offset_mm=0.0,
+                        shift_x_mm=0.0, shift_y_mm=0.0):
     """Convert a PIL label Image to TSPL command bytes ready to send to the printer.
 
-    TSPL (TSC Printer Language) is spoken by the MUNBYN RealWriter 403B and other
+    TSPL (TSC Printer Language) is spoken by the MUNBYN ITPP130B and other
     TSC-compatible thermal printers. Returns bytes rather than str because TSPL's
     BITMAP command embeds the packed 1bpp image data as raw binary in the command
     stream, unlike ZPL's ^GFA which hex-encodes it as text.
@@ -343,12 +359,28 @@ def label_image_to_tspl(img, dpi=203, label="4x6", darkness=12, speed=4,
     resent with each label rather than relying on prior NVRAM state — TSPL
     printers keep whatever was last sent, so a self-contained job avoids surprises
     from stale settings left by a previous run.
+
+    shift_x_mm / shift_y_mm move the image in printer orientation (x across the
+    print head, y along the feed) for printers whose origin isn't at the label
+    edge — e.g. a 108 mm head centred over 4" stock.  Positive values place the
+    BITMAP further along +x/+y; negative values trim that leading edge, which
+    would otherwise print off the label.  A positive x shift also widens SIZE by
+    the same amount: these printers clip at the SIZE width counted from their
+    own origin, so the far edge of the label would be cut off (confirmed on the
+    MUNBYN ITPP130B).  SIZE height is never changed — it's the label length the
+    printer feeds by.
     """
     cfg = _LABEL_CFG[label]
     out = img.rotate(-90, expand=True) if cfg["rotate"] else img
     out = out.convert("1", dither=Image.Dither.NONE)
+    dx  = round(shift_x_mm * dpi / 25.4)
+    dy  = round(shift_y_mm * dpi / 25.4)
+    if dx < 0 or dy < 0:
+        out = out.crop((max(0, -dx), max(0, -dy), out.width, out.height))
+    out = _pad_to_byte_width(out)
     phys_w_mm = (cfg["lh_in"] if cfg["rotate"] else cfg["lw_in"]) * 25.4
     phys_h_mm = (cfg["lw_in"] if cfg["rotate"] else cfg["lh_in"]) * 25.4
+    size_w_mm = phys_w_mm + max(0, dx) * 25.4 / dpi
     rw, rh = out.size
     bytes_per_row = (rw + 7) // 8
     # PIL's mode "1" packing (1=white, 0=black) already matches TSPL's BITMAP
@@ -363,7 +395,7 @@ def label_image_to_tspl(img, dpi=203, label="4x6", darkness=12, speed=4,
         media_line = f"GAP {gap_mm:g} mm,{gap_offset_mm:g} mm\r\n"
 
     header = (
-        f"SIZE {phys_w_mm:.2f} mm,{phys_h_mm:.2f} mm\r\n"
+        f"SIZE {size_w_mm:.2f} mm,{phys_h_mm:.2f} mm\r\n"
         + media_line
         + "REFERENCE 0,0\r\n"
           "OFFSET 0 mm\r\n"
@@ -372,7 +404,7 @@ def label_image_to_tspl(img, dpi=203, label="4x6", darkness=12, speed=4,
           "DIRECTION 0,0\r\n"
           "CLS\r\n"
     ).encode()
-    bitmap_cmd = f"BITMAP 0,0,{bytes_per_row},{rh},0,".encode() + bitmap
+    bitmap_cmd = f"BITMAP {max(0, dx)},{max(0, dy)},{bytes_per_row},{rh},0,".encode() + bitmap
     footer = b"\r\nPRINT 1,1\r\n"
     return header + bitmap_cmd + footer
 
@@ -391,6 +423,71 @@ def make_blank_tspl(dpi=203, label="4x6", darkness=12, speed=4,
                                media, gap_mm, gap_offset_mm)
 
 
+def make_ruler_image(dpi=203, font_path=None, label="4x6", shift_x_mm=0.0, shift_y_mm=0.0):
+    """Render the --ruler printer-alignment test label.
+
+    Drawn in printer orientation (x across the print head, y along the feed),
+    matching --shift-x-mm/--shift-y-mm: a label-edge outline plus 1 mm ticks
+    along every edge (longer at 5 mm, numbered every 10 mm) counted from 0 at
+    the label edge, so one print shows how far off the printer's origin is.
+    Returned in reading orientation like make_label_image(), so the encoders'
+    usual 4x6 rotation lands it back in printer orientation.
+    """
+    cfg  = _LABEL_CFG[label]
+    pw   = round((cfg["lh_in"] if cfg["rotate"] else cfg["lw_in"]) * dpi)
+    ph   = round((cfg["lw_in"] if cfg["rotate"] else cfg["lh_in"]) * dpi)
+    dpmm = dpi / 25.4
+
+    img  = Image.new("RGB", (pw, ph), "white")
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([0, 0, pw - 1, ph - 1], outline="black", width=2)
+
+    num_font = fit_font(font_path, "000", round(1.8 * dpmm), round(5 * dpmm))
+    num_gap  = round(0.5 * dpmm)
+    num_edge = round(7 * dpmm)   # skip numbers this close to a perpendicular ruler
+
+    def numbered(mm, pos, span):
+        return mm % 10 == 0 and num_edge <= pos <= span - num_edge
+
+    def tick_len(mm):
+        return round((4.0 if mm % 10 == 0 else 2.5 if mm % 5 == 0 else 1.2) * dpmm)
+
+    for mm in range(int(pw / dpmm) + 1):          # x rulers: top and bottom edges
+        x, t = round(mm * dpmm), tick_len(mm)
+        draw.line([x, 0, x, t], fill="black", width=2)
+        draw.line([x, ph - 1 - t, x, ph - 1], fill="black", width=2)
+        if numbered(mm, x, pw):
+            draw.text((x, t + num_gap), str(mm), fill="black", font=num_font, anchor="mt")
+            draw.text((x, ph - 1 - t - num_gap), str(mm), fill="black", font=num_font, anchor="mb")
+
+    for mm in range(int(ph / dpmm) + 1):          # y rulers: left and right edges
+        y, t = round(mm * dpmm), tick_len(mm)
+        draw.line([0, y, t, y], fill="black", width=2)
+        draw.line([pw - 1 - t, y, pw - 1, y], fill="black", width=2)
+        if numbered(mm, y, ph):
+            draw.text((t + num_gap, y), str(mm), fill="black", font=num_font, anchor="lm")
+            draw.text((pw - 1 - t - num_gap, y), str(mm), fill="black", font=num_font, anchor="rm")
+
+    lines = [
+        "HAMTAG ALIGNMENT RULER",
+        f"{label} label, {dpi} dpi, shift x {shift_x_mm:+g} mm, y {shift_y_mm:+g} mm",
+        "The 0 mm tick of every ruler should sit on the label edge.",
+        "Left/top ticks cut off: raise --shift-x-mm/--shift-y-mm by",
+        "the first visible mm. Gap before the 0 tick: lower them.",
+    ]
+    margin = round(9 * dpmm)
+    line_h = int((ph - 2 * margin) / (len(lines) * 1.5))
+    size   = min(fit_font(font_path, ln, line_h, pw - 2 * margin).size for ln in lines)
+    font   = ImageFont.truetype(font_path, size)
+    step   = round(size * 1.5)
+    y      = (ph - step * len(lines)) // 2
+    for ln in lines:
+        draw_centered(draw, pw, ln, font, y)
+        y += step
+
+    return img.rotate(90, expand=True) if cfg["rotate"] else img
+
+
 def load_jokes(path):
     """Load one joke per row from a single-column CSV (header + text rows)."""
     jokes = []
@@ -406,6 +503,51 @@ def load_jokes(path):
     if not jokes:
         sys.exit(f"No jokes found in {path}")
     return jokes
+
+
+def load_note_lookup(path):
+    """Load a --note-lookup roster CSV into {CALLSIGN: note}.
+
+    One "callsign, note" row per line; everything after the first comma is the
+    note, so unquoted commas are fine (quoted CSV fields work too).  Callsigns
+    match case-insensitively.  Blank lines, '#' comments and a leading
+    callsign/call header row are skipped.  A row with no note warns and that
+    callsign falls back to --note; a repeated callsign warns and the last row wins.
+    """
+    notes, seen = {}, {}
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.reader(f, skipinitialspace=True)
+            for row in reader:
+                cells = [c.strip() for c in row]
+                if not cells or not cells[0] or cells[0].startswith("#"):
+                    continue
+                call, line = cells[0].upper(), reader.line_num
+                if not seen and call in ("CALLSIGN", "CALL"):
+                    continue
+                if call in seen:
+                    print(f"Warning: {path}:{line}: {call} already listed on line {seen[call]}; "
+                          f"using line {line}", file=sys.stderr)
+                seen[call] = line
+                note = ", ".join(c for c in cells[1:] if c)
+                if note:
+                    notes[call] = note
+                else:
+                    notes.pop(call, None)
+                    print(f"Warning: {path}:{line}: {call} has no note; --note will be used",
+                          file=sys.stderr)
+    except (OSError, UnicodeDecodeError, csv.Error) as exc:
+        sys.exit(f"Error: cannot read note lookup file {path}: {exc}")
+    if not notes:
+        sys.exit(f"No callsign notes found in {path}")
+    return notes
+
+
+def note_for(callsign, notes, default):
+    """Roster note for callsign from --note-lookup, else the --note default."""
+    if notes and callsign:
+        return notes.get(callsign.strip().upper(), default)
+    return default
 
 
 def _wrap_text_block(text, font_path, target_aspect=2.0, working_size=60):
@@ -565,6 +707,49 @@ def _send_calibrate(target, lang="zpl", timeout=30):
         _send_to_printer(_CALIBRATE_ZPL, target, timeout=timeout)
 
 
+def make_encoder(args):
+    """Return (render, blank_label, join_blocks) for the printer language.
+
+    render(pil_img) converts a label image to printer data, blank_label()
+    makes one unprinted label, and join_blocks(list) combines rendered labels
+    into a single payload.
+    """
+    if args.lang == "tspl":
+        def render(pil_img):
+            return label_image_to_tspl(pil_img, args.dpi, args.label, args.darkness, args.speed,
+                                       args.media, args.gap_mm, args.gap_offset_mm,
+                                       args.shift_x_mm, args.shift_y_mm)
+        def blank_label():
+            return make_blank_tspl(args.dpi, args.label, args.darkness, args.speed,
+                                   args.media, args.gap_mm, args.gap_offset_mm)
+        return render, blank_label, b"".join
+
+    def render(pil_img):
+        return label_image_to_zpl(pil_img, args.dpi, args.label)
+    def blank_label():
+        return make_blank_zpl(args.dpi, args.label)
+    return render, blank_label, "\n".join
+
+
+def badge_blocks(badge_data, copies, render, jokes=None, jokenote=None,
+                 dpi=203, font_path=None, label="4x6"):
+    """Rendered labels for one badge in print order.
+
+    Each of the `copies` badge labels is preceded by a freshly chosen random
+    joke label when `jokes` is loaded.  Shared by CLI and GUI printing.
+    """
+    blocks = []
+    for _ in range(copies):
+        if jokes:
+            joke_img = make_joke_image(
+                random.choice(jokes), jokenote=jokenote,
+                dpi=dpi, font_path=font_path, label=label,
+            )
+            blocks.append(render(joke_img))
+        blocks.append(badge_data)
+    return blocks
+
+
 def run_gui(args):
     """Launch the interactive tkinter GUI."""
     try:
@@ -578,6 +763,9 @@ def run_gui(args):
     dpi            = args.dpi
     label          = args.label
     printer_device = args.printer or "/dev/usb/lp0"
+    jokes          = load_jokes(args.jokes) if args.jokes else None
+    render, _, join_blocks = make_encoder(args)
+    notes          = load_note_lookup(args.note_lookup) if args.note_lookup else None
 
     root = tk.Tk()
     root.title("hamtag — Ham Badge Printer")
@@ -684,15 +872,16 @@ def run_gui(args):
     def _print_status():
         cs = call_var.get().strip().upper()
         focused = root.focus_get()
+        roster = f" · Roster: {notes[cs]}" if notes and cs in notes else ""
         if _lookup_found[0]:
             if focused == print_btn:
-                status_var.set(f"{cs} Found in HAMDAT — press Enter to print.")
+                status_var.set(f"{cs} Found in HAMDAT{roster} — press Enter to print.")
             else:
-                status_var.set(f"{cs} Found in HAMDAT — click Print It! to print.")
+                status_var.set(f"{cs} Found in HAMDAT{roster} — click Print It! to print.")
         elif args.db is None:
-            status_var.set("No HAMDAT database — fill in manually.")
+            status_var.set(f"No HAMDAT database{roster} — fill in manually.")
         else:
-            status_var.set(f"{cs} NOT Found in HAMDAT — fill in manually.")
+            status_var.set(f"{cs} NOT Found in HAMDAT{roster} — fill in manually.")
 
     def do_lookup(*_):
         cs = call_var.get().strip().upper()
@@ -703,6 +892,8 @@ def run_gui(args):
         call_var.set(cs)
         name_var.set("")
         location_var.set("")
+        if notes:
+            note_var.set(note_for(cs, notes, default_note))
         db_name, db_city, db_state = lookup_callsign(cs, args.db)
         if db_name:
             name_var.set(db_name)
@@ -732,11 +923,8 @@ def run_gui(args):
             return
         try:
             pil = make_label_image(cs, nm, loc, ban, nt, dpi, font_path, label)
-            if args.lang == "tspl":
-                data = label_image_to_tspl(pil, dpi, label, args.darkness, args.speed,
-                                           args.media, args.gap_mm, args.gap_offset_mm)
-            else:
-                data = label_image_to_zpl(pil, dpi, label)
+            blocks = badge_blocks(render(pil), copies, render, jokes, args.jokenote,
+                                  dpi, font_path, label)
         except Exception as exc:
             status_var.set(f"Render error: {exc}")
             return
@@ -750,8 +938,7 @@ def run_gui(args):
                 )
                 return
         try:
-            payload = data * copies if args.lang == "tspl" else "\n".join([data] * copies)
-            _send_to_printer(payload, printer_device)
+            _send_to_printer(join_blocks(blocks), printer_device)
         except PermissionError:
             messagebox.showerror(
                 "Permission denied",
@@ -762,11 +949,17 @@ def run_gui(args):
         except OSError as exc:
             messagebox.showerror("Print error", str(exc))
             return
-        status_var.set(f"Printed {cs} ×{copies}  ✓" if copies > 1 else f"Printed {cs}  ✓")
-        # Reset for next badge — keep banner and note (they're event-level constants)
+        msg = f"Printed {cs} ×{copies}" if copies > 1 else f"Printed {cs}"
+        if jokes:
+            msg += f" (+{copies} joke{'s' if copies > 1 else ''})"
+        status_var.set(msg + "  ✓")
+        # Reset for next badge — keep banner and note (they're event-level constants),
+        # except a --note-lookup roster note, which belongs to this callsign only
         call_var.set("")
         name_var.set("")
         location_var.set("")
+        if notes:
+            note_var.set(default_note)
         print_btn.configure(state="disabled")
         entries["Callsign"].focus_set()
 
@@ -849,7 +1042,13 @@ def main():
     )
     parser.add_argument(
         "--note", metavar="TEXT",
-        help="Small text pinned to the bottom of the badge",
+        help="Small text pinned to the bottom of the badge "
+             "(the default when --note-lookup has no entry for a callsign)",
+    )
+    parser.add_argument(
+        "--note-lookup", metavar="FILE",
+        help="CSV roster of 'callsign, note' rows, e.g. 'ke2r, Club President'; a listed "
+             "callsign's note replaces --note, which stays the default for everyone else",
     )
     parser.add_argument(
         "--font", metavar="FILE",
@@ -876,7 +1075,7 @@ def main():
     parser.add_argument(
         "--lang", choices=["zpl", "tspl"], default="zpl",
         help="Printer command language — zpl (default, Zebra printers) or "
-             "tspl (TSC-compatible printers, e.g. MUNBYN RealWriter 403B)",
+             "tspl (TSC-compatible printers, e.g. MUNBYN ITPP130B)",
     )
     parser.add_argument(
         "--printer", metavar="TARGET", nargs="?", const="/dev/usb/lp0",
@@ -905,6 +1104,16 @@ def main():
         help="TSPL gap/black-line offset in mm, default 0.0 (--lang tspl only)",
     )
     parser.add_argument(
+        "--shift-x-mm", type=float, default=0.0, metavar="MM",
+        help="TSPL: move the printed image across the print head, + right / - left as "
+             "the --ruler label reads, default 0.0 (--lang tspl only)",
+    )
+    parser.add_argument(
+        "--shift-y-mm", type=float, default=0.0, metavar="MM",
+        help="TSPL: move the printed image along the feed, + down / - up as the "
+             "--ruler label reads, default 0.0 (--lang tspl only)",
+    )
+    parser.add_argument(
         "--copies", type=int, default=1,
         help="Number of copies to print of each badge, sequentially (default: 1)",
     )
@@ -926,6 +1135,11 @@ def main():
     parser.add_argument(
         "--calibrate", action="store_true",
         help="Push non-continuous media settings to NVRAM and run optical label calibration (~JC). Requires --printer.",
+    )
+    parser.add_argument(
+        "--ruler", action="store_true",
+        help="Print an alignment test label with mm rulers along every edge, for measuring "
+             "--shift-x-mm/--shift-y-mm. Honors --label, --dpi, --lang and the output options.",
     )
     parser.add_argument(
         "--gui", action="store_true",
@@ -956,6 +1170,10 @@ def main():
     if args.jokenote and not args.jokes:
         parser.error("--jokenote requires --jokes")
 
+    for opt in ("shift_x_mm", "shift_y_mm"):
+        if not (-25 <= getattr(args, opt) <= 25):
+            parser.error(f"--{opt.replace('_', '-')} must be between -25 and 25")
+
     # ── GUI mode ──────────────────────────────────────────────────────────────
     if args.gui:
         if len(calls) > 1:
@@ -977,8 +1195,11 @@ def main():
         return
 
     # ── CLI mode ──────────────────────────────────────────────────────────────
-    if not calls and not args.name:
-        parser.error("--call and/or --name is required (or use --gui)")
+    if args.ruler and (calls or args.name):
+        parser.error("--ruler prints a standalone test label; don't combine it with --call/--name")
+
+    if not calls and not args.name and not args.ruler:
+        parser.error("--call and/or --name is required (or use --gui or --ruler)")
 
     if len(calls) > 1 and (args.name or args.location):
         parser.error("--name/--location cannot be combined with multiple --call values")
@@ -989,25 +1210,17 @@ def main():
               "callsign lookup disabled.", file=sys.stderr)
 
     font_path = find_font(args.font)
-    entries   = calls if calls else [None]  # None → single manual badge from --name
+    # None → single manual badge from --name; --ruler prints only the test label
+    entries   = [] if args.ruler else (calls if calls else [None])
     jokes     = load_jokes(args.jokes) if args.jokes else None
+    notes     = load_note_lookup(args.note_lookup) if args.note_lookup else None
 
-    if args.lang == "tspl":
-        def render(pil_img):
-            return label_image_to_tspl(pil_img, args.dpi, args.label, args.darkness, args.speed,
-                                       args.media, args.gap_mm, args.gap_offset_mm)
-        def blank_label():
-            return make_blank_tspl(args.dpi, args.label, args.darkness, args.speed,
-                                   args.media, args.gap_mm, args.gap_offset_mm)
-        join_blocks = b"".join
-    else:
-        def render(pil_img):
-            return label_image_to_zpl(pil_img, args.dpi, args.label)
-        def blank_label():
-            return make_blank_zpl(args.dpi, args.label)
-        join_blocks = "\n".join
+    render, blank_label, join_blocks = make_encoder(args)
 
     blocks = []
+    if args.ruler:
+        sx, sy = (args.shift_x_mm, args.shift_y_mm) if args.lang == "tspl" else (0.0, 0.0)
+        blocks.append(render(make_ruler_image(args.dpi, font_path, args.label, sx, sy)))
     for callsign in entries:
         name     = args.name
         location = args.location
@@ -1029,21 +1242,13 @@ def main():
         img = make_label_image(
             display_call, name, location,
             banner=args.banner,
-            note=args.note,
+            note=note_for(callsign, notes, args.note),
             dpi=args.dpi,
             font_path=font_path,
             label=args.label,
         )
-        data = render(img)
-
-        for _ in range(args.copies):
-            if jokes:
-                joke_img = make_joke_image(
-                    random.choice(jokes), jokenote=args.jokenote,
-                    dpi=args.dpi, font_path=font_path, label=args.label,
-                )
-                blocks.append(render(joke_img))
-            blocks.append(data)
+        blocks.extend(badge_blocks(render(img), args.copies, render, jokes, args.jokenote,
+                                   args.dpi, font_path, args.label))
 
     if args.blankevery:
         blank_data = blank_label()
