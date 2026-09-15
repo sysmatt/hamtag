@@ -6,7 +6,8 @@
 > amateur license database into a local SQLite file that hamtag looks up callsigns from.
 > https://github.com/sysmatt/hamdat
 
-A command-line tool (with optional GUI) that generates ZPL name badge labels for Zebra thermal printers.
+A command-line tool (with optional GUI) that generates name badge labels for thermal printers —
+ZPL for Zebra printers, or TSPL for TSC-compatible printers such as the MUNBYN RealWriter 403B.
 Looks up HAM callsigns in a [hamdat](https://github.com/sysmatt/hamdat) SQLite database and produces
 labels on standard 4"×6" or 4"×2" label stock.
 
@@ -18,7 +19,8 @@ labels on standard 4"×6" or 4"×2" label stock.
 - [Pillow](https://pillow.readthedocs.io/) — `pip install Pillow`
 - A [hamdat](https://github.com/sysmatt/hamdat) database at `~/.hamdat/hamdat.db`  
   *(required for callsign lookup; manual `--name`/`--location` works without it)*
-- A Zebra thermal label printer loaded with 4"×6" or 4"×2" label stock
+- A Zebra thermal label printer (ZPL) or a TSC-compatible thermal printer such as the MUNBYN
+  RealWriter 403B (TSPL), loaded with 4"×6" or 4"×2" label stock
 
 ### GUI mode additional requirements
 
@@ -46,7 +48,7 @@ cp hamtag ~/bin/      # or anywhere on your PATH
 
 ### USB printer permissions (Linux)
 
-To send ZPL directly to a USB printer without `sudo`, add yourself to the `lp` group:
+To send label data directly to a USB printer without `sudo`, add yourself to the `lp` group:
 
 ```bash
 sudo usermod -aG lp $USER
@@ -67,7 +69,9 @@ hamtag [--call CALLSIGN [CALLSIGN ...]] [--name NAME] [--location TEXT]
        [--banner TEXT] [--note TEXT]
        [--label {4x6,4x2}] [--dpi {203,300}]
        [--db PATH] [--font FILE]
-       [--output FILE] [--printer [DEVICE]]
+       [--output FILE] [--lang {zpl,tspl}] [--printer [DEVICE]]
+       [--darkness 1-16] [--speed 1-8] [--media {gap,bline,continuous}]
+       [--gap-mm MM] [--gap-offset-mm MM]
        [--copies N] [--blankevery N]
        [--calibrate] [--gui]
 ```
@@ -85,12 +89,21 @@ hamtag [--call CALLSIGN [CALLSIGN ...]] [--name NAME] [--location TEXT]
 | `--dpi {203,300}` | Printer resolution — `203` (default) or `300` |
 | `--db PATH` | hamdat SQLite database path (default: `~/.hamdat/hamdat.db`) |
 | `--font FILE` | TrueType font for all text (auto-detected if omitted) |
-| `--output FILE` | Save ZPL to a file |
-| `--printer [TARGET]` | Send ZPL to a USB device (default: `/dev/usb/lp0`) or network printer (`host[:port]`, default port 9100) |
+| `--output FILE` | Save label data to a file |
+| `--lang {zpl,tspl}` | Printer command language — `zpl` (default, Zebra printers) or `tspl` (TSC-compatible printers, e.g. MUNBYN RealWriter 403B) |
+| `--printer [TARGET]` | Send label data to a USB device (default: `/dev/usb/lp0`) or network printer (`host[:port]`, default port 9100) |
+| `--darkness 1-16` | TSPL print darkness, `1` (lightest) to `16` (darkest), default `12` (`--lang tspl` only) |
+| `--speed 1-8` | TSPL print speed in inches/sec, `1` to `8`, default `4` (`--lang tspl` only) |
+| `--media {gap,bline,continuous}` | TSPL media sensing mode — `gap` (default), `bline` (black mark), or `continuous` stock (`--lang tspl` only) |
+| `--gap-mm MM` | TSPL gap/black-line height in mm, default `3.0` (`--lang tspl` only) |
+| `--gap-offset-mm MM` | TSPL gap/black-line offset in mm, default `0.0` (`--lang tspl` only) |
 | `--copies N` | Number of copies to print of each badge, sequentially (default: `1`) |
 | `--blankevery N` | Print a blank (unprinted) label after every `N` labels, to mark break points for stapling a long run into a book — counts every printed label, including repeated `--copies` |
 | `--calibrate` | Calibrate the printer's label sensor — requires `--printer` (see [Calibration](#calibration)) |
 | `--gui` | Launch interactive GUI — other flags pre-fill the form |
+
+`--gui` currently pre-fills from `--lang` and the TSPL tuning flags too, so `hamtag --gui --lang tspl
+--printer /dev/usb/lp3` runs the GUI against a MUNBYN printer.
 
 At least one of `--call` or `--name` is required in CLI mode (not needed with `--calibrate` or `--gui`).
 
@@ -148,6 +161,12 @@ hamtag --call K2TTA --banner "VOLUNTEER" --output badge.zpl
 
 # Save to file AND send to printer in one shot
 hamtag --call K2TTA --banner "ELMERFEST 2026" --output badge.zpl --printer
+
+# MUNBYN RealWriter 403B (TSPL) — USB
+hamtag --call K2TTA --banner "VOLUNTEER" --lang tspl --printer /dev/usb/lp3
+
+# MUNBYN on black-mark stock, darker/slower for dense label art
+hamtag --call K2TTA --lang tspl --media bline --darkness 15 --speed 2 --printer /dev/usb/lp3
 
 # Network printer (auto-detected by hostname/IP)
 hamtag --call K2TTA --banner "VOLUNTEER" --printer 192.168.1.100
@@ -221,6 +240,10 @@ hamtag --call K2TTA --banner "TEST" --output preview.zpl
 # then upload preview.zpl to labelary.com/viewer.html
 ```
 
+Labelary only understands ZPL — there's no equivalent online viewer for TSPL. For `--lang tspl`,
+sending straight to the printer (or a real print to a file and inspecting it with a TSPL-aware
+tool) is the practical way to check output.
+
 ---
 
 ## Calibration
@@ -258,6 +281,10 @@ power cycle:
 
 The printer will feed 2–4 labels during the calibration cycle — this is normal.
 
+For `--lang tspl` printers, calibration instead sends a single `AUTODETECT` command, which feeds a
+few labels and senses the paper/gap size in one shot — TSPL has no separate NVRAM-save step the
+way ZPL's `^JUS` does.
+
 ---
 
 ## Printer notes
@@ -270,17 +297,33 @@ The printer will feed 2–4 labels during the calibration cycle — this is norm
   block is one label.
 - Each label job also sends a short config preamble (`^MNN ^LT0 ^JUS`) to ensure non-continuous
   gap sensing is active and saved, even if the printer was previously in continuous mode.
+- For `--lang tspl`, the entire label is sent as a single `BITMAP` command (mode 0, OVERWRITE)
+  with the packed 1bpp image data embedded as raw binary — unlike ZPL's `^GFA`, TSPL does not
+  hex-encode the graphic, so `--output` for a TSPL job writes a binary file, not text.
+- Every TSPL job resends `SIZE`/`GAP`/`DENSITY`/`SPEED`/`DIRECTION` from scratch rather than
+  relying on prior NVRAM state, so each print is self-contained regardless of what a previous
+  job (or a previous user) left configured.
 
-### `/dev/usb/lp0` disappears shortly after plugging in
+### MUNBYN RealWriter 403B (TSPL)
 
-On Ubuntu/Debian systems with `system-config-printer-udev` installed, plugging in the printer
-triggers a udev rule (`/lib/udev/rules.d/70-printers.rules`) that runs
-`configure-printer@usb-<bus>-<dev>.service` → `udev-configure-printer`. That helper probes the
-USB device to auto-create/refresh a CUPS queue, and the probe transiently claims the USB
-interface — which evicts the kernel's `usblp` driver out from under `/dev/usb/lp0`. `dmesg` will
-show `usblpN: removed` a second or two after the device is detected, sometimes followed by
-repeated remove/re-add cycles (and `apparmor="DENIED" ... capname="net_admin"` from `cupsd`'s USB
-backend during the same probe — a side effect, not the cause).
+The 403B (USB ID `0d28:ccdd`) identifies as a standard USB Printer-class device and is claimed by
+the kernel's `usblp` driver, showing up as `/dev/usb/lpN` — same raw-device model as the Zebra
+printers above. No official Linux driver exists; a community CUPS filter
+([surma-lodur/Munbyn-CUPS](https://github.com/surma-lodur/Munbyn-CUPS)) confirms the protocol is
+TSPL (TSC Printer Language), which is what `--lang tspl` speaks directly.
+
+### `/dev/usb/lp0` (or `lp3`, etc.) disappears shortly after plugging in
+
+On Ubuntu/Debian systems with `system-config-printer-udev` installed, plugging in *any* USB
+printer-class device — Zebra or MUNBYN alike — triggers a udev rule
+(`/lib/udev/rules.d/70-printers.rules`) that runs `configure-printer@usb-<bus>-<dev>.service` →
+`udev-configure-printer`. That helper probes the USB device to auto-create/refresh a CUPS queue
+(often picking a nonsense driver — e.g. an HP DesignJet PostScript PPD for a MUNBYN label printer
+that speaks neither HP PCL nor PostScript), and the probe transiently claims the USB interface —
+which evicts the kernel's `usblp` driver out from under `/dev/usb/lpN`. `dmesg` will show
+`usblpN: removed` a second or two after the device is detected, sometimes followed by repeated
+remove/re-add cycles (and `apparmor="DENIED" ... capname="net_admin"` from `cupsd`'s USB backend
+during the same probe — a side effect, not the cause).
 
 Fix: stop udev from invoking the CUPS auto-configure helper on USB printer hotplug —
 
@@ -290,7 +333,7 @@ sudo systemctl mask configure-printer@.service
 
 This is reversible (`sudo systemctl unmask configure-printer@.service`) and doesn't touch any
 CUPS queues you already have — it just stops CUPS from grabbing the device every time it's
-plugged in, leaving `/dev/usb/lp0` free for hamtag's raw writes. Unplug/replug the printer after
+plugged in, leaving `/dev/usb/lpN` free for hamtag's raw writes. Unplug/replug the printer after
 masking to confirm the device path stays put.
 
 ### Network printing

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""hamtag - Generate ZPL name badge labels for Zebra thermal printers.
+"""hamtag - Generate name badge labels for thermal printers.
 
-Looks up HAM callsigns in a hamdat SQLite database and produces ZPL
-ready to send to a Zebra thermal label printer.
+Looks up HAM callsigns in a hamdat SQLite database and produces ZPL (Zebra
+printers) or TSPL (TSC-compatible printers, e.g. the MUNBYN RealWriter
+403B) ready to send to a thermal label printer.
 
 Label format: 4"x6" stock rendered as a single PIL bitmap, rotated 90°
 clockwise for landscape orientation (6" wide, 4" tall when worn).
@@ -276,6 +277,67 @@ def make_blank_zpl(dpi=203, label="4x6"):
     return label_image_to_zpl(blank_img, dpi, label)
 
 
+def label_image_to_tspl(img, dpi=203, label="4x6", darkness=12, speed=4,
+                        media="gap", gap_mm=3.0, gap_offset_mm=0.0):
+    """Convert a PIL label Image to TSPL command bytes ready to send to the printer.
+
+    TSPL (TSC Printer Language) is spoken by the MUNBYN RealWriter 403B and other
+    TSC-compatible thermal printers. Returns bytes rather than str because TSPL's
+    BITMAP command embeds the packed 1bpp image data as raw binary in the command
+    stream, unlike ZPL's ^GFA which hex-encodes it as text.
+
+    Unlike label_image_to_zpl(), every setting (size, gap, darkness, speed) is
+    resent with each label rather than relying on prior NVRAM state — TSPL
+    printers keep whatever was last sent, so a self-contained job avoids surprises
+    from stale settings left by a previous run.
+    """
+    cfg = _LABEL_CFG[label]
+    out = img.rotate(-90, expand=True) if cfg["rotate"] else img
+    out = out.convert("1", dither=Image.Dither.NONE)
+    phys_w_mm = (cfg["lh_in"] if cfg["rotate"] else cfg["lw_in"]) * 25.4
+    phys_h_mm = (cfg["lw_in"] if cfg["rotate"] else cfg["lh_in"]) * 25.4
+    rw, rh = out.size
+    bytes_per_row = (rw + 7) // 8
+    # PIL's mode "1" packing (1=white, 0=black) already matches TSPL's BITMAP
+    # wire convention — no bit inversion needed here (unlike the ZPL path).
+    bitmap = out.tobytes()
+
+    if media == "continuous":
+        media_line = "GAP 0,0\r\n"
+    elif media == "bline":
+        media_line = f"BLINE {gap_mm:g} mm,{gap_offset_mm:g} mm\r\n"
+    else:
+        media_line = f"GAP {gap_mm:g} mm,{gap_offset_mm:g} mm\r\n"
+
+    header = (
+        f"SIZE {phys_w_mm:.2f} mm,{phys_h_mm:.2f} mm\r\n"
+        + media_line
+        + "REFERENCE 0,0\r\n"
+          "OFFSET 0 mm\r\n"
+          f"DENSITY {darkness}\r\n"
+          f"SPEED {speed}\r\n"
+          "DIRECTION 0,0\r\n"
+          "CLS\r\n"
+    ).encode()
+    bitmap_cmd = f"BITMAP 0,0,{bytes_per_row},{rh},0,".encode() + bitmap
+    footer = b"\r\nPRINT 1,1\r\n"
+    return header + bitmap_cmd + footer
+
+
+def make_blank_tspl(dpi=203, label="4x6", darkness=12, speed=4,
+                    media="gap", gap_mm=3.0, gap_offset_mm=0.0):
+    """Return TSPL for an all-white (unprinted) label of the correct size.
+
+    Used by --blankevery to feed a blank separator into long print runs.
+    """
+    cfg = _LABEL_CFG[label]
+    lw = round(cfg["lw_in"] * dpi)
+    lh = round(cfg["lh_in"] * dpi)
+    blank_img = Image.new("RGB", (lw, lh), "white")
+    return label_image_to_tspl(blank_img, dpi, label, darkness, speed,
+                               media, gap_mm, gap_offset_mm)
+
+
 def load_jokes(path):
     """Load one joke per row from a single-column CSV (header + text rows)."""
     jokes = []
@@ -369,8 +431,12 @@ def _is_network_printer(target):
     return not str(target).startswith("/")
 
 
-def _send_to_printer(zpl, target, timeout=30):
-    """Send ZPL to a USB device path or a network printer (host[:port], default port 9100)."""
+def _send_to_printer(data, target, timeout=30):
+    """Send label data to a USB device path or a network printer (host[:port], default port 9100).
+
+    data may be str (ZPL) or bytes (TSPL, which embeds raw binary bitmap data).
+    """
+    payload = data if isinstance(data, bytes) else data.encode()
     if _is_network_printer(target):
         target = str(target)
         if ":" in target:
@@ -380,11 +446,11 @@ def _send_to_printer(zpl, target, timeout=30):
             host, port = target, 9100
         with socket.create_connection((host, port), timeout=timeout) as sock:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.sendall(zpl.encode())
+            sock.sendall(payload)
             sock.shutdown(socket.SHUT_WR)
     else:
         with open(target, "wb") as f:
-            f.write(zpl.encode())
+            f.write(payload)
 
 
 _CALIBRATE_CONFIG_ZPL = (
@@ -399,6 +465,11 @@ _CALIBRATE_CONFIG_ZPL = (
 # USB path: single-shot send (no bidirectional comms on /dev/usb/lp*)
 _CALIBRATE_ZPL = _CALIBRATE_CONFIG_ZPL + "~JC"
 
+# AUTODETECT (no args) feeds a few labels and senses paper/gap size in one shot —
+# TSPL keeps no separate "save to NVRAM" step the way ZPL's ^JUS does, so unlike
+# _send_calibrate's ZPL path this needs no multi-step ~HS handshake either.
+_CALIBRATE_TSPL = b"AUTODETECT\r\n"
+
 
 def _recv_hs(sock):
     """Read the three-line ~HS host-status response from an open printer socket."""
@@ -411,13 +482,19 @@ def _recv_hs(sock):
     return buf.decode("ascii", errors="replace")
 
 
-def _send_calibrate(target, timeout=30):
+def _send_calibrate(target, lang="zpl", timeout=30):
     """Push non-continuous media settings to NVRAM then run optical calibration (~JC).
 
     Network printers: uses ~HS status polling between steps so the printer has time
     to finish each operation (especially the NVRAM write) before the next command arrives.
     USB printers: single-shot write (no bidirectional comms available on the device node).
+
+    TSPL printers (lang="tspl") use AUTODETECT instead, which is a single self-contained
+    command on both USB and network targets — see _CALIBRATE_TSPL.
     """
+    if lang == "tspl":
+        _send_to_printer(_CALIBRATE_TSPL, target, timeout=timeout)
+        return
     if _is_network_printer(target):
         target = str(target)
         host, port = (target.rsplit(":", 1) if ":" in target else (target, 9100))
@@ -600,7 +677,11 @@ def run_gui(args):
             return
         try:
             pil = make_label_image(cs, nm, loc, ban, nt, dpi, font_path, label)
-            zpl = label_image_to_zpl(pil, dpi, label)
+            if args.lang == "tspl":
+                data = label_image_to_tspl(pil, dpi, label, args.darkness, args.speed,
+                                           args.media, args.gap_mm, args.gap_offset_mm)
+            else:
+                data = label_image_to_zpl(pil, dpi, label)
         except Exception as exc:
             status_var.set(f"Render error: {exc}")
             return
@@ -614,7 +695,8 @@ def run_gui(args):
                 )
                 return
         try:
-            _send_to_printer("\n".join([zpl] * copies), printer_device)
+            payload = data * copies if args.lang == "tspl" else "\n".join([data] * copies)
+            _send_to_printer(payload, printer_device)
         except PermissionError:
             messagebox.showerror(
                 "Permission denied",
@@ -636,7 +718,7 @@ def run_gui(args):
     # ── Calibrate ─────────────────────────────────────────────────────────────
     def do_calibrate(*_):
         try:
-            _send_calibrate(printer_device)
+            _send_calibrate(printer_device, lang=args.lang)
             status_var.set("Calibration sent — printer will feed 2-4 labels.")
         except OSError as exc:
             messagebox.showerror("Calibration error", str(exc))
@@ -689,7 +771,7 @@ def run_gui(args):
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Generate a ZPL name badge label for a Zebra thermal printer. "
+            "Generate a ZPL or TSPL name badge label for a thermal printer. "
             "Produces landscape output on standard 4\"×6\" label stock."
         )
     )
@@ -733,12 +815,38 @@ def main():
     )
     parser.add_argument(
         "--output", metavar="FILE",
-        help="Write ZPL to FILE instead of stdout",
+        help="Write label data to FILE instead of stdout",
+    )
+    parser.add_argument(
+        "--lang", choices=["zpl", "tspl"], default="zpl",
+        help="Printer command language — zpl (default, Zebra printers) or "
+             "tspl (TSC-compatible printers, e.g. MUNBYN RealWriter 403B)",
     )
     parser.add_argument(
         "--printer", metavar="TARGET", nargs="?", const="/dev/usb/lp0",
-        help="Send ZPL to a printer — USB device path (default: /dev/usb/lp0) "
+        help="Send label data to a printer — USB device path (default: /dev/usb/lp0) "
              "or network host[:port] (default port 9100), e.g. 192.168.1.100 or printer.local:9100",
+    )
+    parser.add_argument(
+        "--darkness", type=int, default=12, metavar="1-16",
+        help="TSPL print darkness, 1 (lightest) to 16 (darkest), default 12 (--lang tspl only)",
+    )
+    parser.add_argument(
+        "--speed", type=int, default=4, metavar="1-8",
+        help="TSPL print speed in inches/sec, 1 to 8, default 4 (--lang tspl only)",
+    )
+    parser.add_argument(
+        "--media", choices=["gap", "bline", "continuous"], default="gap",
+        help="TSPL media sensing mode — gap (default), bline (black mark), "
+             "or continuous stock (--lang tspl only)",
+    )
+    parser.add_argument(
+        "--gap-mm", type=float, default=3.0, metavar="MM",
+        help="TSPL gap/black-line height in mm, default 3.0 (--lang tspl only)",
+    )
+    parser.add_argument(
+        "--gap-offset-mm", type=float, default=0.0, metavar="MM",
+        help="TSPL gap/black-line offset in mm, default 0.0 (--lang tspl only)",
     )
     parser.add_argument(
         "--copies", type=int, default=1,
@@ -780,6 +888,12 @@ def main():
     if args.copies < 1:
         parser.error("--copies must be at least 1")
 
+    if not (1 <= args.darkness <= 16):
+        parser.error("--darkness must be between 1 and 16")
+
+    if not (1 <= args.speed <= 8):
+        parser.error("--speed must be between 1 and 8")
+
     if args.blankevery is not None and args.blankevery < 1:
         parser.error("--blankevery must be at least 1")
 
@@ -799,7 +913,7 @@ def main():
         if not args.printer:
             parser.error("--calibrate requires --printer")
         try:
-            _send_calibrate(args.printer)
+            _send_calibrate(args.printer, lang=args.lang)
             print(f"Calibration sent to {args.printer} — printer will feed 2-4 labels.", file=sys.stderr)
         except OSError as exc:
             sys.exit(f"Error: {exc}")
@@ -816,7 +930,22 @@ def main():
     entries   = calls if calls else [None]  # None → single manual badge from --name
     jokes     = load_jokes(args.jokes) if args.jokes else None
 
-    zpl_blocks = []
+    if args.lang == "tspl":
+        def render(pil_img):
+            return label_image_to_tspl(pil_img, args.dpi, args.label, args.darkness, args.speed,
+                                       args.media, args.gap_mm, args.gap_offset_mm)
+        def blank_label():
+            return make_blank_tspl(args.dpi, args.label, args.darkness, args.speed,
+                                   args.media, args.gap_mm, args.gap_offset_mm)
+        join_blocks = b"".join
+    else:
+        def render(pil_img):
+            return label_image_to_zpl(pil_img, args.dpi, args.label)
+        def blank_label():
+            return make_blank_zpl(args.dpi, args.label)
+        join_blocks = "\n".join
+
+    blocks = []
     for callsign in entries:
         name     = args.name
         location = args.location
@@ -843,7 +972,7 @@ def main():
             font_path=font_path,
             label=args.label,
         )
-        zpl = label_image_to_zpl(img, args.dpi, args.label)
+        data = render(img)
 
         for _ in range(args.copies):
             if jokes:
@@ -851,27 +980,30 @@ def main():
                     random.choice(jokes), jokenote=args.jokenote,
                     dpi=args.dpi, font_path=font_path, label=args.label,
                 )
-                zpl_blocks.append(label_image_to_zpl(joke_img, args.dpi, args.label))
-            zpl_blocks.append(zpl)
+                blocks.append(render(joke_img))
+            blocks.append(data)
 
     if args.blankevery:
-        blank_zpl = make_blank_zpl(args.dpi, args.label)
+        blank_data = blank_label()
         spaced_blocks = []
-        for i, zpl in enumerate(zpl_blocks, start=1):
-            spaced_blocks.append(zpl)
+        for i, data in enumerate(blocks, start=1):
+            spaced_blocks.append(data)
             if i % args.blankevery == 0:
-                spaced_blocks.append(blank_zpl)
+                spaced_blocks.append(blank_data)
         # Always end the run on a blank label, even if the count didn't land
         # on one, so the last badge in the stack is never left exposed.
-        if not spaced_blocks or spaced_blocks[-1] != blank_zpl:
-            spaced_blocks.append(blank_zpl)
-        zpl_blocks = spaced_blocks
+        if not spaced_blocks or spaced_blocks[-1] != blank_data:
+            spaced_blocks.append(blank_data)
+        blocks = spaced_blocks
 
-    all_zpl = "\n".join(zpl_blocks)
+    all_data = join_blocks(blocks)
 
     if args.output:
-        Path(args.output).write_text(all_zpl)
-        print(f"ZPL written to {args.output}", file=sys.stderr)
+        if isinstance(all_data, bytes):
+            Path(args.output).write_bytes(all_data)
+        else:
+            Path(args.output).write_text(all_data)
+        print(f"Label data written to {args.output}", file=sys.stderr)
 
     if args.printer:
         target = args.printer
@@ -884,7 +1016,7 @@ def main():
                     "You may need: sudo chmod a+rw /dev/usb/lp0"
                 )
         try:
-            _send_to_printer(all_zpl, target)
+            _send_to_printer(all_data, target)
             print(f"Sent to {target}", file=sys.stderr)
         except PermissionError:
             sys.exit(
@@ -896,7 +1028,10 @@ def main():
             sys.exit(f"Error sending to printer: {exc}")
 
     if not args.output and not args.printer:
-        print(all_zpl)
+        if isinstance(all_data, bytes):
+            sys.stdout.buffer.write(all_data)
+        else:
+            print(all_data)
 
 
 if __name__ == "__main__":
