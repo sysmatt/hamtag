@@ -28,6 +28,7 @@ except ImportError:
     sys.exit("Install Pillow:  pip install Pillow")
 
 DB_DEFAULT = Path.home() / ".hamdat" / "hamdat.db"
+DB_ENV     = "HAMDAT_DB"
 
 # TTF fonts searched in order.  Bold weights preferred; slashed-zero fonts first.
 # sudo apt install fonts-noto   fonts-firacode   fonts-hack
@@ -82,28 +83,80 @@ def find_font(custom_path=None):
     )
 
 
+# A callsign can have several license_header rows (one per past holder), and
+# row order is just FCC file load order.  Prefer the active license, then the
+# most recent last_action_date (stored MM/DD/YYYY, so reorder to YYYYMMDD to
+# sort chronologically), then id as a final tiebreak.
+_LOOKUP_SQL = """
+    SELECT e.first_name, e.mi, e.last_name, e.entity_name, e.city, e.state
+      FROM license_header h
+      JOIN entity e ON e.unique_system_identifier = h.unique_system_identifier
+     WHERE h.call_sign = ?
+       AND (e.entity_type = 'L' OR e.entity_type = '')
+     ORDER BY CASE WHEN h.license_status = 'A' THEN 0 ELSE 1 END,
+              substr(h.last_action_date, 7, 4) || substr(h.last_action_date, 1, 2)
+                  || substr(h.last_action_date, 4, 2) DESC,
+              h.id DESC,
+              CASE WHEN e.entity_type = 'L' THEN 0 ELSE 1 END
+     LIMIT 1
+"""
+
+
+def _open_db(db_path):
+    """Open the hamdat DB read-only (never creates a file); raises sqlite3.Error."""
+    uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def resolve_db(cli_path):
+    """Pick the hamdat DB: --db, then $HAMDAT_DB, then DB_DEFAULT if present.
+
+    Returns the validated Path, or None when no path was specified and the
+    default doesn't exist (callsign lookup disabled).  A path that is missing
+    or can't be opened as a hamdat DB is a fatal error.
+    """
+    env_path = os.environ.get(DB_ENV, "").strip()
+    if cli_path:
+        path, source = Path(cli_path).expanduser(), "--db"
+    elif env_path:
+        path, source = Path(env_path).expanduser(), f"${DB_ENV}"
+    elif DB_DEFAULT.exists():
+        path, source = DB_DEFAULT, "default location"
+    else:
+        return None
+
+    if not path.exists():
+        sys.exit(f"Error: hamdat database not found: {path} (from {source})")
+    try:
+        conn = _open_db(path)
+        try:
+            # Run the real lookup query so a wrong file or schema fails here
+            conn.execute(_LOOKUP_SQL, ("",)).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        sys.exit(f"Error: cannot open hamdat database {path} (from {source}): {exc}")
+    return path
+
+
 def lookup_callsign(callsign, db_path):
-    """Return (name, city, state) from hamdat DB, or (None, None, None)."""
-    db = Path(db_path)
-    if not db.exists():
+    """Return (name, city, state) from hamdat DB, or (None, None, None).
+
+    db_path comes from resolve_db(); None means lookup is disabled.
+    """
+    if db_path is None:
         return None, None, None
 
-    conn = sqlite3.connect(db)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        """
-        SELECT e.first_name, e.mi, e.last_name, e.entity_name, e.city, e.state
-          FROM license_header h
-          JOIN entity e ON e.unique_system_identifier = h.unique_system_identifier
-         WHERE h.call_sign = ?
-           AND (e.entity_type = 'L' OR e.entity_type = '')
-         ORDER BY h.rowid DESC,
-                  CASE WHEN e.entity_type = 'L' THEN 0 ELSE 1 END
-         LIMIT 1
-        """,
-        (callsign.strip().upper(),),
-    ).fetchone()
-    conn.close()
+    try:
+        conn = _open_db(db_path)
+        try:
+            row = conn.execute(_LOOKUP_SQL, (callsign.strip().upper(),)).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        sys.exit(f"Error: hamdat database {db_path}: {exc}")
 
     if not row:
         return None, None, None
@@ -636,6 +689,8 @@ def run_gui(args):
                 status_var.set(f"{cs} Found in HAMDAT — press Enter to print.")
             else:
                 status_var.set(f"{cs} Found in HAMDAT — click Print It! to print.")
+        elif args.db is None:
+            status_var.set("No HAMDAT database — fill in manually.")
         else:
             status_var.set(f"{cs} NOT Found in HAMDAT — fill in manually.")
 
@@ -802,8 +857,9 @@ def main():
              "install fonts-hack for a slashed zero)",
     )
     parser.add_argument(
-        "--db", metavar="PATH", default=str(DB_DEFAULT),
-        help=f"hamdat SQLite database path (default: {DB_DEFAULT})",
+        "--db", metavar="PATH",
+        help=f"hamdat SQLite database path (default: ${DB_ENV} if set, "
+             f"else {DB_DEFAULT} if it exists)",
     )
     parser.add_argument(
         "--dpi", type=int, choices=[203, 300], default=203,
@@ -905,6 +961,7 @@ def main():
         if len(calls) > 1:
             print(f"Note: GUI mode only pre-fills the first callsign ({calls[0]}); "
                   f"the other {len(calls) - 1} were ignored.", file=sys.stderr)
+        args.db = resolve_db(args.db)
         run_gui(args)
         return
 
@@ -925,6 +982,11 @@ def main():
 
     if len(calls) > 1 and (args.name or args.location):
         parser.error("--name/--location cannot be combined with multiple --call values")
+
+    args.db = resolve_db(args.db)
+    if calls and args.db is None:
+        print(f"Note: no hamdat database at {DB_DEFAULT} (and ${DB_ENV} not set) — "
+              "callsign lookup disabled.", file=sys.stderr)
 
     font_path = find_font(args.font)
     entries   = calls if calls else [None]  # None → single manual badge from --name
@@ -950,7 +1012,7 @@ def main():
         name     = args.name
         location = args.location
 
-        if callsign:
+        if callsign and args.db is not None:
             db_name, db_city, db_state = lookup_callsign(callsign, args.db)
             if not name and db_name:
                 name = db_name

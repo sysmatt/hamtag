@@ -19,8 +19,10 @@ labels on standard 4"×6" or 4"×2" label stock.
 
 - Python 3.9+
 - [Pillow](https://pillow.readthedocs.io/) — `pip install Pillow`
-- A [hamdat](https://github.com/sysmatt/hamdat) database at `~/.hamdat/hamdat.db`  
-  *(required for callsign lookup; manual `--name`/`--location` works without it)*
+- A [hamdat](https://github.com/sysmatt/hamdat) database — used automatically from `~/.hamdat/hamdat.db`
+  if it exists, or point at one with `--db PATH` or the `HAMDAT_DB` environment variable  
+  *(required for callsign lookup; manual `--name`/`--location` works without it. A `--db`/`HAMDAT_DB`
+  path that is missing or can't be opened is a fatal error)*
 - A Zebra thermal label printer (ZPL) or an older-model TSC-compatible MUNBYN thermal printer
   (TSPL) — **not** the RealWriter 403B, see the TSPL compatibility note below — loaded with
   4"×6" or 4"×2" label stock
@@ -90,7 +92,7 @@ hamtag [--call CALLSIGN [CALLSIGN ...]] [--name NAME] [--location TEXT]
 | `--note TEXT` | Small text pinned to the bottom of the badge |
 | `--label {4x6,4x2}` | Label stock — `4x6` landscape badge (default) or `4x2` portrait |
 | `--dpi {203,300}` | Printer resolution — `203` (default) or `300` |
-| `--db PATH` | hamdat SQLite database path (default: `~/.hamdat/hamdat.db`) |
+| `--db PATH` | hamdat SQLite database path. If omitted: `$HAMDAT_DB` if set, else `~/.hamdat/hamdat.db` if it exists, else lookup is disabled. A given path that is missing or not a valid hamdat DB exits with an error |
 | `--font FILE` | TrueType font for all text (auto-detected if omitted) |
 | `--output FILE` | Save label data to a file |
 | `--lang {zpl,tspl}` | Printer command language — `zpl` (default, Zebra printers) or `tspl` (TSC-compatible printers, e.g. older MUNBYN models — **not** the RealWriter 403B) |
