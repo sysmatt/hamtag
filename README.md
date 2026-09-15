@@ -7,7 +7,9 @@
 > https://github.com/sysmatt/hamdat
 
 A command-line tool (with optional GUI) that generates name badge labels for thermal printers —
-ZPL for Zebra printers, or TSPL for TSC-compatible printers such as the MUNBYN RealWriter 403B.
+ZPL for Zebra printers, or TSPL for TSC-compatible printers such as older MUNBYN thermal label
+printers (see [`--lang tspl` compatibility](#--lang-tspl-compatibility--confirmed-vs-not) for
+which models this actually covers).
 Looks up HAM callsigns in a [hamdat](https://github.com/sysmatt/hamdat) SQLite database and produces
 labels on standard 4"×6" or 4"×2" label stock.
 
@@ -19,8 +21,9 @@ labels on standard 4"×6" or 4"×2" label stock.
 - [Pillow](https://pillow.readthedocs.io/) — `pip install Pillow`
 - A [hamdat](https://github.com/sysmatt/hamdat) database at `~/.hamdat/hamdat.db`  
   *(required for callsign lookup; manual `--name`/`--location` works without it)*
-- A Zebra thermal label printer (ZPL) or a TSC-compatible thermal printer such as the MUNBYN
-  RealWriter 403B (TSPL), loaded with 4"×6" or 4"×2" label stock
+- A Zebra thermal label printer (ZPL) or an older-model TSC-compatible MUNBYN thermal printer
+  (TSPL) — **not** the RealWriter 403B, see the TSPL compatibility note below — loaded with
+  4"×6" or 4"×2" label stock
 
 ### GUI mode additional requirements
 
@@ -90,7 +93,7 @@ hamtag [--call CALLSIGN [CALLSIGN ...]] [--name NAME] [--location TEXT]
 | `--db PATH` | hamdat SQLite database path (default: `~/.hamdat/hamdat.db`) |
 | `--font FILE` | TrueType font for all text (auto-detected if omitted) |
 | `--output FILE` | Save label data to a file |
-| `--lang {zpl,tspl}` | Printer command language — `zpl` (default, Zebra printers) or `tspl` (TSC-compatible printers, e.g. MUNBYN RealWriter 403B) |
+| `--lang {zpl,tspl}` | Printer command language — `zpl` (default, Zebra printers) or `tspl` (TSC-compatible printers, e.g. older MUNBYN models — **not** the RealWriter 403B) |
 | `--printer [TARGET]` | Send label data to a USB device (default: `/dev/usb/lp0`) or network printer (`host[:port]`, default port 9100) |
 | `--darkness 1-16` | TSPL print darkness, `1` (lightest) to `16` (darkest), default `12` (`--lang tspl` only) |
 | `--speed 1-8` | TSPL print speed in inches/sec, `1` to `8`, default `4` (`--lang tspl` only) |
@@ -103,7 +106,7 @@ hamtag [--call CALLSIGN [CALLSIGN ...]] [--name NAME] [--location TEXT]
 | `--gui` | Launch interactive GUI — other flags pre-fill the form |
 
 `--gui` currently pre-fills from `--lang` and the TSPL tuning flags too, so `hamtag --gui --lang tspl
---printer /dev/usb/lp3` runs the GUI against a MUNBYN printer.
+--printer /dev/usb/lp0` runs the GUI against a TSPL printer.
 
 At least one of `--call` or `--name` is required in CLI mode (not needed with `--calibrate` or `--gui`).
 
@@ -162,11 +165,11 @@ hamtag --call K2TTA --banner "VOLUNTEER" --output badge.zpl
 # Save to file AND send to printer in one shot
 hamtag --call K2TTA --banner "ELMERFEST 2026" --output badge.zpl --printer
 
-# MUNBYN RealWriter 403B (TSPL) — USB
-hamtag --call K2TTA --banner "VOLUNTEER" --lang tspl --printer /dev/usb/lp3
+# TSPL printer (older MUNBYN models, TSC-compatible) — USB
+hamtag --call K2TTA --banner "VOLUNTEER" --lang tspl --printer /dev/usb/lp0
 
-# MUNBYN on black-mark stock, darker/slower for dense label art
-hamtag --call K2TTA --lang tspl --media bline --darkness 15 --speed 2 --printer /dev/usb/lp3
+# TSPL on black-mark stock, darker/slower for dense label art
+hamtag --call K2TTA --lang tspl --media bline --darkness 15 --speed 2 --printer /dev/usb/lp0
 
 # Network printer (auto-detected by hostname/IP)
 hamtag --call K2TTA --banner "VOLUNTEER" --printer 192.168.1.100
@@ -304,13 +307,35 @@ way ZPL's `^JUS` does.
   relying on prior NVRAM state, so each print is self-contained regardless of what a previous
   job (or a previous user) left configured.
 
-### MUNBYN RealWriter 403B (TSPL)
+### `--lang tspl` compatibility — confirmed vs. not
 
-The 403B (USB ID `0d28:ccdd`) identifies as a standard USB Printer-class device and is claimed by
-the kernel's `usblp` driver, showing up as `/dev/usb/lpN` — same raw-device model as the Zebra
-printers above. No official Linux driver exists; a community CUPS filter
-([surma-lodur/Munbyn-CUPS](https://github.com/surma-lodur/Munbyn-CUPS)) confirms the protocol is
-TSPL (TSC Printer Language), which is what `--lang tspl` speaks directly.
+`--lang tspl` is confirmed working over raw USB on **older MUNBYN thermal label printer models**
+(tested end-to-end: 4×6 and 4×2, both print correctly).
+
+**The MUNBYN RealWriter 403B does NOT work with `--lang tspl` — do not spend more time on it.**
+It looked like a good candidate (USB ID `0d28:ccdd`, identifies as a standard USB Printer-class
+device claimed by the kernel's `usblp` driver at `/dev/usb/lpN`, and a community CUPS filter,
+[surma-lodur/Munbyn-CUPS](https://github.com/surma-lodur/Munbyn-CUPS), claims the protocol is
+TSPL), but real-hardware testing disproved it:
+
+- Raw TSPL and raw ESC/POS commands sent directly to `/dev/usb/lpN` produce zero reaction (no
+  feed, no print, nothing) — same result over a paired Bluetooth RFCOMM (`/dev/rfcomm0`) connection.
+- The standard USB Printer-class `GET_PORT_STATUS` control request (`usblp`'s `LPGETSTATUS`
+  ioctl) returns `EIO` — the device doesn't answer basic class status queries either.
+- A Bluetooth HCI snoop capture (`adb`, Developer options → Bluetooth HCI snoop log → **Full**
+  mode — the default **Filtered** mode redacts payload content and is useless for this) of the
+  official MUNBYN Android app doing a real successful print revealed the actual protocol: a
+  **proprietary Protobuf-encoded message stream over Bluetooth SPP**, not TSPL or ESC/POS text at
+  all (confirmed via textbook protobuf wire-format tag/varint bytes in the capture, e.g.
+  `18 a0 8a 05 20 01 28 01 30 66 ...` decoding as sequential field tags 3–12). The 403B's USB
+  Printer-class descriptor appears to be present for OS/driver-detection purposes only — the real
+  print engine is likely wired to Bluetooth exclusively.
+- Reverse-engineering that protobuf schema (plus its image encoding, which isn't simple 1bpp
+  packed rows) would be a real undertaking — decompiling the MUNBYN app APK for the vendor SDK's
+  unobfuscated class/field names is probably the fastest path in, if this is ever revisited.
+
+If you pick up a *newer* MUNBYN model and hit the same "writes succeed, printer does nothing"
+symptom, suspect the same thing before assuming a bug in this code.
 
 ### `/dev/usb/lp0` (or `lp3`, etc.) disappears shortly after plugging in
 
