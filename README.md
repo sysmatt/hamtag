@@ -78,7 +78,7 @@ hamtag [--call CALLSIGN [CALLSIGN ...]] [--name NAME] [--location TEXT]
        [--darkness 1-16] [--speed 1-8] [--media {gap,bline,continuous}]
        [--gap-mm MM] [--gap-offset-mm MM] [--shift-x-mm MM] [--shift-y-mm MM]
        [--copies N] [--blankevery N] [--jokes FILE] [--jokenote TEXT]
-       [--calibrate] [--ruler] [--gui]
+       [--calibrate] [--ruler] [--gui] [--attendance FILE]
 ```
 
 ### Options
@@ -112,6 +112,7 @@ hamtag [--call CALLSIGN [CALLSIGN ...]] [--name NAME] [--location TEXT]
 | `--calibrate` | Calibrate the printer's label sensor — requires `--printer` (see [Calibration](#calibration)) |
 | `--ruler` | Print an alignment test label with mm rulers along every edge, for measuring `--shift-x-mm`/`--shift-y-mm`; honors `--label`, `--dpi`, `--lang` and the output options, can't be combined with `--call`/`--name` |
 | `--gui` | Launch interactive GUI — other flags pre-fill the form |
+| `--attendance FILE` | GUI only: record the callsign and name of every printed badge in a CSV, one row per person (see [Attendance](#attendance---attendance)) |
 
 `--gui` currently pre-fills from `--lang` and the TSPL tuning flags too, so `hamtag --gui --lang tspl
 --printer /dev/usb/lp0` runs the GUI against a TSPL printer. `--jokes`/`--jokenote` apply in the GUI
@@ -143,6 +144,25 @@ line and clears the per-badge fields, ready for the next operator.
 
 The **Calibrate** button sends the calibration sequence to the printer (see [Calibration](#calibration)).
 Run it whenever you load a new roll of labels.
+
+### Attendance (`--attendance`)
+
+```bash
+hamtag --gui --note "Guest" --attendance attendance.csv
+```
+
+After every successful print the GUI records the badge's **Callsign** and **Name** in the CSV
+(header `callsign,name`), and the status bar shows the running head count.
+
+- One row per person, oldest first.  Printing someone again (e.g. to fix a typo in their name)
+  replaces their row and moves it to the end — the most recent entry wins.
+- People are matched by callsign (case-insensitive); guests with no callsign are matched by name.
+- Extra copies of a badge don't add rows; failed prints aren't recorded.
+- The file is created if missing, and read and rewritten at startup (so a bad path fails
+  immediately) and after every print, so edits made to it while the GUI is running are kept.
+- Saves are crash-safe: the new list is written to `FILE.new` and synced to disk, the current file
+  is copied to `FILE.old` (the previous save), then `FILE.new` is atomically renamed over `FILE`.
+- If a save fails after a print, a warning dialog appears; the label has already printed.
 
 ---
 

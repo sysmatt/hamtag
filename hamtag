@@ -16,6 +16,7 @@ import argparse
 import csv
 import os
 import random
+import shutil
 import socket
 import sqlite3
 import sys
@@ -543,6 +544,76 @@ def load_note_lookup(path):
     return notes
 
 
+def _attendance_key(callsign, name):
+    """Dedup key: the callsign if there is one, else the name (non-ham guests)."""
+    callsign = (callsign or "").strip().upper()
+    if callsign:
+        return ("call", callsign)
+    return ("name", " ".join((name or "").split()).casefold())
+
+
+def load_attendance(path):
+    """Load an --attendance CSV into an ordered {key: (CALLSIGN, name)}, oldest first.
+
+    A missing file is an empty list.  Blank rows and a callsign/name header are
+    skipped; a repeated person keeps only the last row.  Raises OSError/csv.Error.
+    """
+    people = {}
+    try:
+        f = open(path, newline="", encoding="utf-8-sig")
+    except FileNotFoundError:
+        return people
+    with f:
+        for row in csv.reader(f):
+            cells = [c.strip() for c in row] + ["", ""]
+            call, name = cells[0].upper(), cells[1]
+            if not (call or name) or (call == "CALLSIGN" and name.lower() == "name"):
+                continue
+            key = _attendance_key(call, name)
+            people.pop(key, None)
+            people[key] = (call, name)
+    return people
+
+
+def save_attendance(path, people):
+    """Crash-safely write {key: (callsign, name)} to the --attendance CSV.
+
+    Writes FILE.new and fsyncs it, copies the current FILE to FILE.old, then
+    atomically renames FILE.new over FILE and fsyncs the directory.  FILE is
+    never missing or partial; FILE.old is the previous save.
+    """
+    path = Path(path)
+    new = path.with_name(path.name + ".new")
+    with open(new, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["callsign", "name"])
+        writer.writerows(people.values())
+        f.flush()
+        os.fsync(f.fileno())
+    if path.exists():
+        shutil.copy2(path, path.with_name(path.name + ".old"))
+    os.replace(new, path)
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def record_attendance(path, callsign, name):
+    """Re-read the attendance file, move this person to the end, write it back.
+
+    Returns the number of people on the list.
+    """
+    people = load_attendance(path)
+    callsign, name = (callsign or "").strip().upper(), (name or "").strip()
+    key = _attendance_key(callsign, name)
+    people.pop(key, None)
+    people[key] = (callsign, name)
+    save_attendance(path, people)
+    return len(people)
+
+
 def note_for(callsign, notes, default):
     """Roster note for callsign from --note-lookup, else the --note default."""
     if notes and callsign:
@@ -766,6 +837,13 @@ def run_gui(args):
     jokes          = load_jokes(args.jokes) if args.jokes else None
     render, _, join_blocks = make_encoder(args)
     notes          = load_note_lookup(args.note_lookup) if args.note_lookup else None
+    attendance     = args.attendance
+    if attendance:
+        # Read and rewrite now so a bad path or permissions fail at launch, not mid-event
+        try:
+            save_attendance(attendance, load_attendance(attendance))
+        except (OSError, UnicodeDecodeError, csv.Error) as exc:
+            sys.exit(f"Error: cannot read/write attendance file {attendance}: {exc}")
 
     root = tk.Tk()
     root.title("hamtag — Ham Badge Printer")
@@ -952,7 +1030,17 @@ def run_gui(args):
         msg = f"Printed {cs} ×{copies}" if copies > 1 else f"Printed {cs}"
         if jokes:
             msg += f" (+{copies} joke{'s' if copies > 1 else ''})"
-        status_var.set(msg + "  ✓")
+        msg += "  ✓"
+        if attendance:
+            try:
+                count = record_attendance(attendance, call_var.get(), name_var.get())
+                msg += f"  · Attendance: {count}"
+            except (OSError, UnicodeDecodeError, csv.Error) as exc:
+                messagebox.showwarning(
+                    "Attendance not saved",
+                    f"Label printed, but {cs} was not recorded in {attendance}:\n{exc}",
+                )
+        status_var.set(msg)
         # Reset for next badge — keep banner and note (they're event-level constants),
         # except a --note-lookup roster note, which belongs to this callsign only
         call_var.set("")
@@ -1145,6 +1233,11 @@ def main():
         "--gui", action="store_true",
         help="Launch interactive GUI (other flags pre-fill the form)",
     )
+    parser.add_argument(
+        "--attendance", metavar="FILE",
+        help="GUI only: record callsign,name of each printed badge in this CSV "
+             "(one row per person, most recent entry wins)",
+    )
     args = parser.parse_args()
 
     calls = []
@@ -1166,6 +1259,9 @@ def main():
 
     if args.blankevery is not None and args.blankevery < 1:
         parser.error("--blankevery must be at least 1")
+
+    if args.attendance and not args.gui:
+        parser.error("--attendance requires --gui")
 
     if args.jokenote and not args.jokes:
         parser.error("--jokenote requires --jokes")
